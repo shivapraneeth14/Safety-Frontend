@@ -1,0 +1,40 @@
+# Flutter/Dart/Pub related
+frontend/.dart_tool/
+frontend/.flutter-plugins
+frontend/.flutter-plugins-dependencies
+frontend/.packages
+frontend/build/
+frontend/generated_plugin_registrant.dart
+
+# Android
+frontend/android/.gradle/
+frontend/android/app/build/
+frontend/android/gradle/
+frontend/*.keystore
+
+# iOS
+frontend/ios/Flutter/Flutter.framework
+frontend/ios/Flutter/Flutter.podspec
+frontend/ios/Flutter/Generated.xcconfig
+frontend/ios/Flutter/ephemeral/
+frontend/ios/Pods/
+frontend/ios/Runner.xcworkspace/
+frontend/ios/build/
+
+# Web
+frontend/web/main.dart.js
+frontend/web/flutter_service_worker.js
+frontend/web/flutter.js
+frontend/web/version.json
+frontend/web/.dart_tool/
+
+# IDEs
+frontend/.idea/
+frontend/.vscode/
+
+# Misc
+*.log
+*.lock
+*.tmp
+*.swp
+*.DS_Store
