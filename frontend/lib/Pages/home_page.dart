@@ -24,6 +24,9 @@ class _HomePageState extends State<HomePage> {
   LatLng? _currentPosition;
   double _rotation = 0.0;
   final double _currentZoom = 17.0;
+  
+  // Threat markers rendered as red dots
+  List<Marker> _threatMarkers = [];
 
   StreamSubscription<Position>? _positionStream;
   StreamSubscription<CompassEvent>? _compassStream;
@@ -244,7 +247,11 @@ class _HomePageState extends State<HomePage> {
       debugPrint('🔗 Connecting to WebSocket: $backendWsUrl');
 
       _ws!.stream.listen(
-        (msg) => debugPrint('📥 WS Message: $msg'),
+        (msg) {
+          debugPrint('📥 WS Message: $msg');
+          _handleWsMessage(msg);
+        },
+      
         onDone: () => debugPrint('ℹ️ WebSocket closed'),
         onError: (e) => debugPrint('❌ WebSocket error: $e'),
       );
@@ -257,6 +264,54 @@ class _HomePageState extends State<HomePage> {
       debugPrint('✅ WebSocket connected successfully');
     } catch (e) {
       debugPrint('❌ WebSocket connection failed: $e');
+    }
+  }
+
+  void _handleWsMessage(dynamic msg) {
+    try {
+      final String text = msg is String ? msg : msg.toString();
+      final dynamic payload = jsonDecode(text);
+
+      // Expecting either { type: 'threats', positions: [ {id, lat, lng}, ... ] }
+      // or a direct { threats: [ {id, lat, lng}, ... ] }
+      final bool isThreatsType = payload is Map && payload['type'] == 'threats';
+      final List<dynamic> positions =
+          (payload is Map && payload['positions'] is List)
+              ? (payload['positions'] as List)
+              : (payload is Map && payload['threats'] is List)
+                  ? (payload['threats'] as List)
+                  : const [];
+
+      if (isThreatsType || positions.isNotEmpty) {
+        final List<Marker> markers = [];
+        for (final p in positions) {
+          if (p is! Map) continue;
+          final num? latNum = p['lat'] as num?;
+          final num? lngNum = p['lng'] as num?;
+          if (latNum == null || lngNum == null) continue;
+
+          markers.add(
+            Marker(
+              point: LatLng(latNum.toDouble(), lngNum.toDouble()),
+              width: 18,
+              height: 18,
+              child: const Icon(
+                Icons.circle,
+                color: Colors.red,
+                size: 12,
+              ),
+            ),
+          );
+        }
+
+        if (mounted) {
+          setState(() {
+            _threatMarkers = markers;
+          });
+        }
+      }
+    } catch (e) {
+      // ignore malformed messages
     }
   }
 
@@ -343,6 +398,11 @@ class _HomePageState extends State<HomePage> {
                         ),
                       ],
                     ),
+                    // Threat markers layer (red dots)
+                    if (_threatMarkers.isNotEmpty)
+                      MarkerLayer(
+                        markers: _threatMarkers,
+                      ),
                   ],
                 ),
                 Positioned(
