@@ -27,6 +27,11 @@ class _HomePageState extends State<HomePage> {
   
   // Threat markers rendered as red dots
   List<Marker> _threatMarkers = [];
+  
+  // Smooth threat movement tracking
+  Map<String, LatLng> _threatPositions = {};
+  Map<String, LatLng> _targetThreatPositions = {};
+  Timer? _threatAnimationTimer;
 
   StreamSubscription<Position>? _positionStream;
   StreamSubscription<CompassEvent>? _compassStream;
@@ -155,20 +160,19 @@ class _HomePageState extends State<HomePage> {
   }
 
   void _updatePosition(Position pos, {bool initial = false}) {
-    _currentPosition = LatLng(pos.latitude, pos.longitude);
-    try {
-      if (mounted) {
-        Future.delayed(const Duration(milliseconds: 100), () {
-          if (mounted) {
-            _mapController.move(_currentPosition!, _currentZoom);
-            debugPrint(
-              '📍 Map Updated at: ${_currentPosition!.latitude}, ${_currentPosition!.longitude}',
-            );
-          }
-        });
-      }
-    } catch (e) {
-      debugPrint('⚠️ Map not ready yet: $e');
+    final newPosition = LatLng(pos.latitude, pos.longitude);
+    
+    // Only update if position changed significantly (smoothness optimization)
+    if (_currentPosition != null) {
+      final distance = _calculateDistance(_currentPosition!, newPosition);
+      if (distance < 1.0) return; // Skip if moved less than 1 meter
+    }
+    
+    _currentPosition = newPosition;
+    
+    // Throttle map updates for smoothness
+    if (initial || _shouldUpdateMap()) {
+      _updateMapPosition();
     }
 
     _lastTimestamp = pos.timestamp ?? DateTime.now();
@@ -176,7 +180,54 @@ class _HomePageState extends State<HomePage> {
     _lastHeading = pos.heading;
 
     _applyFusion(pos);
-    setState(() {});
+    
+    // Only setState when necessary
+    if (mounted) {
+      setState(() {});
+    }
+  }
+  
+  double _calculateDistance(LatLng pos1, LatLng pos2) {
+    const double earthRadius = 6371000; // meters
+    final double lat1Rad = pos1.latitude * pi / 180;
+    final double lat2Rad = pos2.latitude * pi / 180;
+    final double deltaLat = (pos2.latitude - pos1.latitude) * pi / 180;
+    final double deltaLng = (pos2.longitude - pos1.longitude) * pi / 180;
+    
+    final double a = sin(deltaLat / 2) * sin(deltaLat / 2) +
+        cos(lat1Rad) * cos(lat2Rad) *
+        sin(deltaLng / 2) * sin(deltaLng / 2);
+    final double c = 2 * atan2(sqrt(a), sqrt(1 - a));
+    
+    return earthRadius * c;
+  }
+  
+  DateTime? _lastMapUpdate;
+  bool _shouldUpdateMap() {
+    final now = DateTime.now();
+    if (_lastMapUpdate == null) {
+      _lastMapUpdate = now;
+      return true;
+    }
+    // Update map max every 500ms for smoothness
+    if (now.difference(_lastMapUpdate!).inMilliseconds > 500) {
+      _lastMapUpdate = now;
+      return true;
+    }
+    return false;
+  }
+  
+  void _updateMapPosition() {
+    try {
+      if (mounted && _currentPosition != null) {
+        _mapController.move(_currentPosition!, _currentZoom);
+        debugPrint(
+          '📍 Map Updated at: ${_currentPosition!.latitude}, ${_currentPosition!.longitude}',
+        );
+      }
+    } catch (e) {
+      debugPrint('⚠️ Map not ready yet: $e');
+    }
   }
 
   void _applyFusion(Position gps) {
@@ -214,8 +265,39 @@ class _HomePageState extends State<HomePage> {
 
   void _initCompass() {
     _compassStream = FlutterCompass.events?.listen((event) {
-      if (event.heading != null) _rotation = event.heading!;
+      if (event.heading != null) {
+        _updateRotation(event.heading!);
+      }
     });
+  }
+  
+  void _updateRotation(double newHeading) {
+    // Smooth rotation with angle normalization
+    final double normalizedNew = _normalizeAngle(newHeading);
+    final double normalizedCurrent = _normalizeAngle(_rotation);
+    
+    // Calculate shortest rotation path
+    double delta = normalizedNew - normalizedCurrent;
+    if (delta > 180) delta -= 360;
+    if (delta < -180) delta += 360;
+    
+    // Apply smoothing factor (0.1 = very smooth, 0.5 = responsive)
+    const double smoothingFactor = 0.15;
+    final double smoothedDelta = delta * smoothingFactor;
+    
+    final double newRotation = normalizedCurrent + smoothedDelta;
+    
+    if ((newRotation - _rotation).abs() > 0.5) { // Only update if change is significant
+      setState(() {
+        _rotation = _normalizeAngle(newRotation);
+      });
+    }
+  }
+  
+  double _normalizeAngle(double angle) {
+    while (angle < 0) angle += 360;
+    while (angle >= 360) angle -= 360;
+    return angle;
   }
 
   void _initSensors() {
@@ -256,8 +338,8 @@ class _HomePageState extends State<HomePage> {
         onError: (e) => debugPrint('❌ WebSocket error: $e'),
       );
 
-      // Start sending data every second
-      _sendTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      // Start sending data every 2 seconds (reduced frequency for smoothness)
+      _sendTimer = Timer.periodic(const Duration(seconds: 2), (_) {
         _sendWebSocket();
       });
 
@@ -283,35 +365,112 @@ class _HomePageState extends State<HomePage> {
                   : const [];
 
       if (isThreatsType || positions.isNotEmpty) {
-        final List<Marker> markers = [];
-        for (final p in positions) {
-          if (p is! Map) continue;
-          final num? latNum = p['lat'] as num?;
-          final num? lngNum = p['lng'] as num?;
-          if (latNum == null || lngNum == null) continue;
-
-          markers.add(
-            Marker(
-              point: LatLng(latNum.toDouble(), lngNum.toDouble()),
-              width: 18,
-              height: 18,
-              child: const Icon(
-                Icons.circle,
-                color: Colors.red,
-                size: 12,
-              ),
-            ),
-          );
-        }
-
-        if (mounted) {
-          setState(() {
-            _threatMarkers = markers;
-          });
-        }
+        _updateThreatPositions(positions);
       }
     } catch (e) {
-      // ignore malformed messages
+      debugPrint('❌ Failed to parse WebSocket message: $e');
+      debugPrint('Raw message: $msg');
+    }
+  }
+  
+  void _updateThreatPositions(List<dynamic> positions) {
+    // Update target positions for smooth movement
+    _targetThreatPositions.clear();
+    for (final p in positions) {
+      if (p is! Map) continue;
+      final String? id = p['id'] as String?;
+      final num? latNum = p['lat'] as num?;
+      final num? lngNum = p['lng'] as num?;
+      if (id == null || latNum == null || lngNum == null) continue;
+      
+      _targetThreatPositions[id] = LatLng(latNum.toDouble(), lngNum.toDouble());
+    }
+    
+    // Initialize current positions if not set
+    for (final id in _targetThreatPositions.keys) {
+      if (!_threatPositions.containsKey(id)) {
+        _threatPositions[id] = _targetThreatPositions[id]!;
+      }
+    }
+    
+    // Remove threats that are no longer present
+    _threatPositions.removeWhere((id, _) => !_targetThreatPositions.containsKey(id));
+    
+    // Start smooth animation if not already running
+    if (_threatAnimationTimer == null || !_threatAnimationTimer!.isActive) {
+      _startThreatAnimation();
+    }
+  }
+  
+  void _startThreatAnimation() {
+    _threatAnimationTimer = Timer.periodic(const Duration(milliseconds: 50), (timer) {
+      bool hasChanges = false;
+      
+      for (final id in _targetThreatPositions.keys) {
+        final current = _threatPositions[id]!;
+        final target = _targetThreatPositions[id]!;
+        
+        // Calculate distance to target
+        final distance = _calculateDistance(current, target);
+        
+        if (distance > 0.5) { // Only animate if more than 0.5 meters away
+          // Smooth interpolation (0.1 = smooth, 0.3 = responsive)
+          const double lerpFactor = 0.15;
+          final double newLat = current.latitude + (target.latitude - current.latitude) * lerpFactor;
+          final double newLng = current.longitude + (target.longitude - current.longitude) * lerpFactor;
+          
+          _threatPositions[id] = LatLng(newLat, newLng);
+          hasChanges = true;
+        }
+      }
+      
+      if (hasChanges && mounted) {
+        _updateThreatMarkers();
+      } else if (!hasChanges) {
+        // Stop animation when all threats reach their targets
+        timer.cancel();
+      }
+    });
+  }
+  
+  void _updateThreatMarkers() {
+    final List<Marker> markers = [];
+    
+    for (final entry in _threatPositions.entries) {
+      final String id = entry.key;
+      final LatLng position = entry.value;
+      
+      markers.add(
+        Marker(
+          point: position,
+          width: 20,
+          height: 20,
+          child: Container(
+            decoration: BoxDecoration(
+              color: Colors.red,
+              shape: BoxShape.circle,
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.red.withOpacity(0.3),
+                  blurRadius: 8,
+                  spreadRadius: 2,
+                ),
+              ],
+            ),
+            child: const Icon(
+              Icons.location_on,
+              color: Colors.white,
+              size: 12,
+            ),
+          ),
+        ),
+      );
+    }
+    
+    if (mounted) {
+      setState(() {
+        _threatMarkers = markers;
+      });
     }
   }
 
@@ -321,8 +480,14 @@ class _HomePageState extends State<HomePage> {
       return;
     }
 
+    // Ensure userId is available before sending
+    if (user?['_id'] == null) {
+      debugPrint('⚠️ Cannot send — User ID not available.');
+      return;
+    }
+
     final payload = {
-      "userId": user?['_id'],
+      "userId": user!['_id'],
       "latitude": _fusedPosition!.latitude,
       "longitude": _fusedPosition!.longitude,
       "speed": _lastSpeed,
@@ -360,6 +525,7 @@ class _HomePageState extends State<HomePage> {
     _magStream?.cancel();
     _connectivityStream?.cancel();
     _sendTimer?.cancel();
+    _threatAnimationTimer?.cancel();
     _ws?.sink.close();
     super.dispose();
   }
@@ -373,7 +539,10 @@ class _HomePageState extends State<HomePage> {
               children: [
                 FlutterMap(
                   mapController: _mapController,
-                  options: MapOptions(),
+                  options: MapOptions(
+                    initialCenter: _currentPosition ?? const LatLng(0, 0),
+                    initialZoom: _currentZoom,
+                  ),
                   children: [
                     TileLayer(
                       urlTemplate:
