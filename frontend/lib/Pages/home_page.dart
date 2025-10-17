@@ -52,6 +52,16 @@ class _HomePageState extends State<HomePage> {
 
   Map<String, dynamic>? user;
   bool isLoading = true;
+  
+  // Status indicators
+  bool _isConnected = false;
+  bool _isSendingData = false;
+  DateTime? _lastDataSent;
+  String _connectionStatus = 'Connecting...';
+  
+  // Data viewer
+  bool _showDataViewer = false;
+  Map<String, dynamic>? _lastSentData;
 
   @override
   void initState() {
@@ -65,6 +75,7 @@ class _HomePageState extends State<HomePage> {
       _initWebSocket();
     });
   }
+
 
   Future<void> fetchUserProfile() async {
     print("fetchUserProfile: started");
@@ -105,6 +116,8 @@ class _HomePageState extends State<HomePage> {
           isLoading = false;
         });
         print("fetchUserProfile: User data loaded successfully");
+        print("User ID: ${user?['_id']}");
+        print("User name: ${user?['name'] ?? 'Unknown'}");
       } else if (response.statusCode == 401) {
         print("fetchUserProfile: Unauthorized, token may be expired");
         setState(() {
@@ -130,15 +143,20 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _initLocation() async {
+    debugPrint("📍 Initializing location services...");
+    
     bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
+    debugPrint("📍 Location service enabled: $serviceEnabled");
     if (!serviceEnabled) {
       debugPrint("⚠️ Location services disabled.");
       return;
     }
+    
     LocationPermission permission = await Geolocator.requestPermission();
+    debugPrint("📍 Location permission: $permission");
     if (permission == LocationPermission.denied ||
         permission == LocationPermission.deniedForever) {
-      debugPrint("⚠️ Location permission denied.");
+      debugPrint("⚠️ Location permission denied: $permission");
       return;
     }
 
@@ -253,7 +271,12 @@ class _HomePageState extends State<HomePage> {
       debugPrint('❌ WebSocket URL is empty');
       return;
     }
+    _connectWebSocket();
+  }
+
+  void _connectWebSocket() {
     try {
+      _ws?.sink.close(); // Close existing connection if any
       _ws = WebSocketChannel.connect(Uri.parse(backendWsUrl));
       debugPrint('🔗 Connecting to WebSocket: $backendWsUrl');
 
@@ -261,21 +284,52 @@ class _HomePageState extends State<HomePage> {
         (msg) {
           debugPrint('📥 WS Message: $msg');
           _handleWsMessage(msg);
+          setState(() {
+            _isConnected = true;
+            _connectionStatus = 'Connected';
+          });
         },
       
-        onDone: () => debugPrint('ℹ️ WebSocket closed'),
-        onError: (e) => debugPrint('❌ WebSocket error: $e'),
+        onDone: () {
+          debugPrint('ℹ️ WebSocket closed - attempting to reconnect...');
+          setState(() {
+            _isConnected = false;
+            _connectionStatus = 'Reconnecting...';
+          });
+          _reconnectWebSocket();
+        },
+        onError: (e) {
+          debugPrint('❌ WebSocket error: $e - attempting to reconnect...');
+          setState(() {
+            _isConnected = false;
+            _connectionStatus = 'Connection Error';
+          });
+          _reconnectWebSocket();
+        },
       );
 
       // Start sending data every second
+      _sendTimer?.cancel();
       _sendTimer = Timer.periodic(const Duration(seconds: 1), (_) {
         _sendWebSocket();
       });
 
       debugPrint('✅ WebSocket connected successfully');
+      setState(() {
+        _isConnected = true;
+        _connectionStatus = 'Connected';
+      });
     } catch (e) {
-      debugPrint('❌ WebSocket connection failed: $e');
+      debugPrint('❌ WebSocket connection failed: $e - will retry...');
+      _reconnectWebSocket();
     }
+  }
+
+  void _reconnectWebSocket() {
+    Timer(const Duration(seconds: 3), () {
+      debugPrint('🔄 Attempting to reconnect WebSocket...');
+      _connectWebSocket();
+    });
   }
 
   void _handleWsMessage(dynamic msg) {
@@ -336,8 +390,14 @@ class _HomePageState extends State<HomePage> {
     // Ensure userId is available before sending
     if (user?['_id'] == null) {
       debugPrint('⚠️ Cannot send — User ID not available.');
+      debugPrint('User object: $user');
       return;
     }
+    
+    debugPrint('👤 User ID: ${user!['_id']}');
+    debugPrint('🌍 Position: ${_fusedPosition!.latitude}, ${_fusedPosition!.longitude}');
+
+    // WebSocket connection will be checked in the try-catch block below
 
     final payload = {
       "userId": user!['_id'],
@@ -362,10 +422,27 @@ class _HomePageState extends State<HomePage> {
     debugPrint(jsonEncode(payload));
 
     try {
+      setState(() {
+        _isSendingData = true;
+      });
+      
       _ws!.sink.add(jsonEncode(payload));
+      _lastDataSent = DateTime.now();
+      _lastSentData = payload; // Store the data for viewing
+      
+      setState(() {
+        _isSendingData = false;
+      });
+      
       debugPrint("✅ Data sent successfully at ${DateTime.now()}");
     } catch (e) {
-      debugPrint("❌ Failed to send data: $e");
+      setState(() {
+        _isSendingData = false;
+        _isConnected = false;
+        _connectionStatus = 'Send Error';
+      });
+      debugPrint("❌ Failed to send data: $e - attempting to reconnect...");
+      _reconnectWebSocket();
     }
   }
 
@@ -389,19 +466,145 @@ class _HomePageState extends State<HomePage> {
           ? const Center(child: CircularProgressIndicator())
           : Stack(
               children: [
-                FlutterMap(
-                  mapController: _mapController,
-                  options: MapOptions(
-                    onTap: (tapPosition, point) {
-                      _userHasInteracted = true;
-                    },
-                    onPointerDown: (event, point) {
-                      _userHasInteracted = true;
-                    },
-                    onPointerUp: (event, point) {
-                      _userHasInteracted = true;
-                    },
+                // Status Bar at the top
+                Positioned(
+                  top: 0,
+                  left: 0,
+                  right: 0,
+                  child: Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: Colors.black87,
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withOpacity(0.3),
+                          blurRadius: 4,
+                          offset: const Offset(0, 2),
+                        ),
+                      ],
+                    ),
+                    child: SafeArea(
+                      child: Row(
+                        children: [
+                          // Connection Status
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                            decoration: BoxDecoration(
+                              color: _isConnected ? Colors.green : Colors.red,
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(
+                                  _isConnected ? Icons.wifi : Icons.wifi_off,
+                                  color: Colors.white,
+                                  size: 16,
+                                ),
+                                const SizedBox(width: 4),
+                                Text(
+                                  _connectionStatus,
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w500,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          // Data Transmission Indicator
+                          if (_isSendingData)
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                              decoration: BoxDecoration(
+                                color: Colors.blue,
+                                borderRadius: BorderRadius.circular(12),
+                              ),
+                              child: const Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  SizedBox(
+                                    width: 12,
+                                    height: 12,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                      valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                                    ),
+                                  ),
+                                  SizedBox(width: 4),
+                                  Text(
+                                    'Sending...',
+                                    style: TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w500,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          const Spacer(),
+                          // User Info
+                          if (user != null)
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                              decoration: BoxDecoration(
+                                color: Colors.white.withOpacity(0.2),
+                                borderRadius: BorderRadius.circular(12),
+                              ),
+                              child: Text(
+                                'ID: ${user!['_id']?.toString().substring(0, 8) ?? 'Unknown'}...',
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w500,
+                                ),
+                              ),
+                            ),
+                          const SizedBox(width: 8),
+                          // Last Data Sent
+                          if (_lastDataSent != null)
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                              decoration: BoxDecoration(
+                                color: Colors.green.withOpacity(0.8),
+                                borderRadius: BorderRadius.circular(12),
+                              ),
+                              child: Text(
+                                '✓ ${_lastDataSent!.toString().substring(11, 19)}',
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w500,
+                                ),
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
                   ),
+                ),
+                // Map with top padding for status bar
+                Positioned(
+                  top: 80, // Space for status bar
+                  left: 0,
+                  right: 0,
+                  bottom: 0,
+                  child: FlutterMap(
+                    mapController: _mapController,
+                    options: MapOptions(
+                      onTap: (tapPosition, point) {
+                        _userHasInteracted = true;
+                      },
+                      onPointerDown: (event, point) {
+                        _userHasInteracted = true;
+                      },
+                      onPointerUp: (event, point) {
+                        _userHasInteracted = true;
+                      },
+                    ),
                   children: [
                     TileLayer(
                       urlTemplate:
@@ -433,6 +636,8 @@ class _HomePageState extends State<HomePage> {
                       ),
                   ],
                 ),
+                ),
+                // My Location Button
                 Positioned(
                   bottom: 20,
                   right: 20,
@@ -449,8 +654,179 @@ class _HomePageState extends State<HomePage> {
                     child: const Icon(Icons.my_location),
                   ),
                 ),
+                // Data Viewer Button
+                Positioned(
+                  bottom: 90,
+                  right: 20,
+                  child: FloatingActionButton(
+                    backgroundColor: _showDataViewer ? Colors.blue : Colors.white,
+                    foregroundColor: _showDataViewer ? Colors.white : Colors.black,
+                    onPressed: () {
+                      setState(() {
+                        _showDataViewer = !_showDataViewer;
+                      });
+                    },
+                    child: Icon(_showDataViewer ? Icons.close : Icons.data_usage),
+                  ),
+                ),
+                // Data Viewer Overlay
+                if (_showDataViewer)
+                  Positioned(
+                    top: 100,
+                    left: 20,
+                    right: 20,
+                    child: Container(
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        color: Colors.black87,
+                        borderRadius: BorderRadius.circular(12),
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.black.withOpacity(0.3),
+                            blurRadius: 8,
+                            offset: const Offset(0, 4),
+                          ),
+                        ],
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          // Header
+                          Row(
+                            children: [
+                              const Icon(Icons.data_usage, color: Colors.white),
+                              const SizedBox(width: 8),
+                              const Text(
+                                'Data Being Sent',
+                                style: TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 18,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                              const Spacer(),
+                              IconButton(
+                                onPressed: () {
+                                  setState(() {
+                                    _showDataViewer = false;
+                                  });
+                                },
+                                icon: const Icon(Icons.close, color: Colors.white),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 12),
+                          // Data Content
+                          if (_lastSentData != null) ...[
+                            _buildDataItem('User ID', _lastSentData!['userId']?.toString() ?? 'N/A'),
+                            _buildDataItem('Latitude', _lastSentData!['latitude']?.toString() ?? 'N/A'),
+                            _buildDataItem('Longitude', _lastSentData!['longitude']?.toString() ?? 'N/A'),
+                            _buildDataItem('Speed', _lastSentData!['speed']?.toString() ?? 'N/A'),
+                            _buildDataItem('Heading', _lastSentData!['heading']?.toString() ?? 'N/A'),
+                            _buildDataItem('Connectivity', _lastSentData!['connectivity']?.toString() ?? 'N/A'),
+                            _buildDataItem('Timestamp', _lastSentData!['timestamp']?.toString() ?? 'N/A'),
+                            // Sensor data
+                            if (_lastSentData!['accel'] != null)
+                              _buildDataItem('Accelerometer', 'X: ${_lastSentData!['accel']['x']?.toStringAsFixed(2)}, Y: ${_lastSentData!['accel']['y']?.toStringAsFixed(2)}, Z: ${_lastSentData!['accel']['z']?.toStringAsFixed(2)}'),
+                            if (_lastSentData!['gyro'] != null)
+                              _buildDataItem('Gyroscope', 'X: ${_lastSentData!['gyro']['x']?.toStringAsFixed(4)}, Y: ${_lastSentData!['gyro']['y']?.toStringAsFixed(4)}, Z: ${_lastSentData!['gyro']['z']?.toStringAsFixed(4)}'),
+                            if (_lastSentData!['magnetometer'] != null)
+                              _buildDataItem('Magnetometer', 'X: ${_lastSentData!['magnetometer']['x']?.toStringAsFixed(2)}, Y: ${_lastSentData!['magnetometer']['y']?.toStringAsFixed(2)}, Z: ${_lastSentData!['magnetometer']['z']?.toStringAsFixed(2)}'),
+                          ] else ...[
+                            const Text(
+                              'No data sent yet',
+                              style: TextStyle(color: Colors.grey),
+                            ),
+                          ],
+                          const SizedBox(height: 16),
+                          // Action Buttons
+                          Row(
+                            children: [
+                              Expanded(
+                                child: ElevatedButton.icon(
+                                  onPressed: () {
+                                    // Clear all stored data
+                                    setState(() {
+                                      _lastSentData = null;
+                                    });
+                                    ScaffoldMessenger.of(context).showSnackBar(
+                                      const SnackBar(
+                                        content: Text('Data cleared from display'),
+                                        backgroundColor: Colors.green,
+                                      ),
+                                    );
+                                  },
+                                  icon: const Icon(Icons.clear_all),
+                                  label: const Text('Clear Data'),
+                                  style: ElevatedButton.styleFrom(
+                                    backgroundColor: Colors.red,
+                                    foregroundColor: Colors.white,
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: ElevatedButton.icon(
+                                  onPressed: () {
+                                    // Copy data to clipboard
+                                    if (_lastSentData != null) {
+                                      // You can implement clipboard functionality here
+                                      ScaffoldMessenger.of(context).showSnackBar(
+                                        const SnackBar(
+                                          content: Text('Data copied to clipboard'),
+                                          backgroundColor: Colors.blue,
+                                        ),
+                                      );
+                                    }
+                                  },
+                                  icon: const Icon(Icons.copy),
+                                  label: const Text('Copy'),
+                                  style: ElevatedButton.styleFrom(
+                                    backgroundColor: Colors.blue,
+                                    foregroundColor: Colors.white,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
               ],
             ),
+    );
+  }
+
+  Widget _buildDataItem(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 100,
+            child: Text(
+              '$label:',
+              style: const TextStyle(
+                color: Colors.cyan,
+                fontSize: 12,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+          ),
+          Expanded(
+            child: Text(
+              value,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 12,
+              ),
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
