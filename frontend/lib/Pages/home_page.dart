@@ -25,6 +25,7 @@ class _HomePageState extends State<HomePage> {
   double _rotation = 0.0;
   final double _currentZoom = 17.0;
   bool _userHasInteracted = false;
+  bool _hasCompassHeading = false;
   
   // Threat markers rendered as red dots
   List<Marker> _threatMarkers = [];
@@ -203,6 +204,11 @@ class _HomePageState extends State<HomePage> {
     _lastSpeed = pos.speed;
     _lastHeading = pos.heading;
 
+    // If no reliable compass heading yet, fall back to GPS/course heading
+    if (!_hasCompassHeading && _lastHeading != null && _lastHeading! >= 0) {
+      _rotation = _lastHeading!;
+    }
+
     // Skip fusion on web to prevent location drift
     // _applyFusion(pos);
     setState(() {});
@@ -243,7 +249,11 @@ class _HomePageState extends State<HomePage> {
 
   void _initCompass() {
     _compassStream = FlutterCompass.events?.listen((event) {
-      if (event.heading != null) _rotation = event.heading!;
+      if (event.heading != null) {
+        _hasCompassHeading = true;
+        _rotation = event.heading!;
+        if (mounted) setState(() {});
+      }
     });
   }
 
@@ -617,7 +627,7 @@ class _HomePageState extends State<HomePage> {
                           point: _currentPosition!,
                           width: 60,
                           height: 60,
-                          rotate: true,
+                          rotate: false,
                           child: Transform.rotate(
                             angle: -_rotation * pi / 180,
                             child: const Icon(
