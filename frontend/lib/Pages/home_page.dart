@@ -23,7 +23,7 @@ class _HomePageState extends State<HomePage> {
   final MapController _mapController = MapController();
   LatLng? _currentPosition;
   double _rotation = 0.0;
-  double _currentZoom = 17.0;
+  final double _currentZoom = 17.0;
   
   // Threat markers rendered as red dots
   List<Marker> _threatMarkers = [];
@@ -164,7 +164,6 @@ class _HomePageState extends State<HomePage> {
       if (mounted) {
         Future.delayed(const Duration(milliseconds: 100), () {
           if (mounted) {
-            _currentZoom = _mapController.camera?.zoom ?? _currentZoom;
             _mapController.move(_currentPosition!, _currentZoom);
             debugPrint(
               '📍 Map Updated at: ${_currentPosition!.latitude}, ${_currentPosition!.longitude}',
@@ -386,16 +385,7 @@ class _HomePageState extends State<HomePage> {
               children: [
                 FlutterMap(
                   mapController: _mapController,
-                  options: MapOptions(
-                    initialCenter: _currentPosition ?? const LatLng(0, 0),
-                    initialZoom: _currentZoom,
-                    interactionOptions: const InteractionOptions(
-                      enableMultiFingerGestureRace: true,
-                      flags: InteractiveFlag.all,
-                    ),
-                    minZoom: 3.0,
-                    maxZoom: 18.0,
-                  ),
+                  options: MapOptions(),
                   children: [
                     TileLayer(
                       urlTemplate:
@@ -435,7 +425,6 @@ class _HomePageState extends State<HomePage> {
                     foregroundColor: Colors.black,
                     onPressed: () {
                       if (_currentPosition != null) {
-                        _currentZoom = _mapController.camera?.zoom ?? _currentZoom;
                         _mapController.move(_currentPosition!, _currentZoom);
                         debugPrint('🎯 Centered map to current location');
                       }
