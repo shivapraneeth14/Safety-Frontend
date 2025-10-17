@@ -26,6 +26,12 @@ class _HomePageState extends State<HomePage> {
   final double _currentZoom = 17.0;
   bool _userHasInteracted = false;
   bool _hasCompassHeading = false;
+  // Smoothed heading we actually render (degrees 0..360)
+  double _displayHeadingDeg = 0.0;
+  // Source selector: when moving use GPS course; when stationary use compass
+  bool _usingGpsCourse = false;
+  // User calibration offset, applied to heading (degrees, can be negative)
+  double _calibrationOffsetDeg = -42.0;
   
   // Threat markers rendered as red dots
   List<Marker> _threatMarkers = [];
@@ -74,6 +80,7 @@ class _HomePageState extends State<HomePage> {
       _initCompass();
       _initSensors();
       _initWebSocket();
+      // Using fixed calibration set in code
     });
   }
 
@@ -203,11 +210,7 @@ class _HomePageState extends State<HomePage> {
     _lastTimestamp = pos.timestamp ?? DateTime.now();
     _lastSpeed = pos.speed;
     _lastHeading = pos.heading;
-
-    // If no reliable compass heading yet, fall back to GPS/course heading
-    if (!_hasCompassHeading && _lastHeading != null && _lastHeading! >= 0) {
-      _rotation = _lastHeading!;
-    }
+    _updateHeadingFromSources();
 
     // Skip fusion on web to prevent location drift
     // _applyFusion(pos);
@@ -251,11 +254,59 @@ class _HomePageState extends State<HomePage> {
     _compassStream = FlutterCompass.events?.listen((event) {
       if (event.heading != null) {
         _hasCompassHeading = true;
-        _rotation = event.heading!;
+        _rotation = event.heading!; // raw compass degrees
+        _updateHeadingFromSources();
         if (mounted) setState(() {});
       }
     });
   }
+
+  // Decide which heading to use and smooth it for display
+  void _updateHeadingFromSources() {
+    // Normalize helper to 0..360
+    double normalize(double d) {
+      double n = d % 360.0;
+      if (n < 0) n += 360.0;
+      return n;
+    }
+
+    double? gpsCourseDeg = (_lastHeading != null && _lastHeading! >= 0)
+        ? normalize(_lastHeading!)
+        : null;
+
+    double? compassDeg = _hasCompassHeading ? normalize(_rotation) : null;
+
+    // If moving > ~2.5 m/s (~9 km/h), prefer GPS course as it's usually more stable while driving
+    final bool movingFast = (_lastSpeed ?? 0) > 2.5;
+    double? chosen;
+    if (movingFast && gpsCourseDeg != null) {
+      _usingGpsCourse = true;
+      chosen = gpsCourseDeg;
+    } else if (compassDeg != null) {
+      _usingGpsCourse = false;
+      chosen = compassDeg;
+    } else if (gpsCourseDeg != null) {
+      _usingGpsCourse = true;
+      chosen = gpsCourseDeg;
+    }
+
+    if (chosen == null) return;
+
+    // Apply user calibration offset before smoothing
+    chosen = normalize(chosen + _calibrationOffsetDeg);
+
+    // Smooth with exponential moving average to reduce jitter
+    const double alpha = 0.25; // higher = more responsive, lower = smoother
+    // Handle wrap-around (e.g., 359 to 1 should average across 0)
+    double current = _displayHeadingDeg;
+    double delta = chosen - current;
+    if (delta > 180) delta -= 360;
+    if (delta < -180) delta += 360;
+    double next = current + alpha * delta;
+    _displayHeadingDeg = normalize(next);
+  }
+
+  // Calibration persistence disabled; using fixed offset above
 
   void _initSensors() {
     _accelStream = accelerometerEvents.listen((e) => _lastAccel = e);
@@ -591,6 +642,30 @@ class _HomePageState extends State<HomePage> {
                                 ),
                               ),
                             ),
+                          const SizedBox(width: 8),
+                          // Heading Indicator (fixed calibration; controls removed)
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                            decoration: BoxDecoration(
+                              color: Colors.orange.withOpacity(0.9),
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                const Icon(Icons.explore, color: Colors.white, size: 14),
+                                const SizedBox(width: 4),
+                                Text(
+                                  '${_displayHeadingDeg.toStringAsFixed(0)}° ${_usingGpsCourse ? 'gps' : (_hasCompassHeading ? 'compass' : 'n/a')} (+42°)',
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w500,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
                         ],
                       ),
                     ),
@@ -628,8 +703,10 @@ class _HomePageState extends State<HomePage> {
                           width: 60,
                           height: 60,
                           rotate: false,
-                          child: Transform.rotate(
-                            angle: -_rotation * pi / 180,
+                          child: AnimatedRotation(
+                            turns: ((_displayHeadingDeg % 360) / 360),
+                            duration: const Duration(milliseconds: 150),
+                            curve: Curves.easeOut,
                             child: const Icon(
                               Icons.navigation,
                               color: Colors.blue,
