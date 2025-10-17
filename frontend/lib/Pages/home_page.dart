@@ -24,6 +24,7 @@ class _HomePageState extends State<HomePage> {
   LatLng? _currentPosition;
   double _rotation = 0.0;
   final double _currentZoom = 17.0;
+  bool _userHasInteracted = false;
   
   // Threat markers rendered as red dots
   List<Marker> _threatMarkers = [];
@@ -160,8 +161,9 @@ class _HomePageState extends State<HomePage> {
     // For web, use GPS directly without fusion to avoid drift
     _fusedPosition = _currentPosition;
     
+    // Only auto-center the map during initial location fetch or if user hasn't interacted yet
     try {
-      if (mounted) {
+      if (mounted && (initial || !_userHasInteracted)) {
         Future.delayed(const Duration(milliseconds: 100), () {
           if (mounted) {
             _mapController.move(_currentPosition!, _currentZoom);
@@ -170,6 +172,10 @@ class _HomePageState extends State<HomePage> {
             );
           }
         });
+      } else {
+        debugPrint(
+          '📍 Location Updated (no auto-center): ${_currentPosition!.latitude}, ${_currentPosition!.longitude}',
+        );
       }
     } catch (e) {
       debugPrint('⚠️ Map not ready yet: $e');
@@ -385,7 +391,20 @@ class _HomePageState extends State<HomePage> {
               children: [
                 FlutterMap(
                   mapController: _mapController,
-                  options: MapOptions(),
+                  options: MapOptions(
+                    onTap: (tapPosition, point) {
+                      _userHasInteracted = true;
+                    },
+                    onPointerDown: (event) {
+                      _userHasInteracted = true;
+                    },
+                    onMapEvent: (event) {
+                      // Detect manual zoom or pan interactions
+                      if (event is MapEventMove || event is MapEventMoveStart || event is MapEventMoveEnd) {
+                        _userHasInteracted = true;
+                      }
+                    },
+                  ),
                   children: [
                     TileLayer(
                       urlTemplate:
@@ -425,6 +444,7 @@ class _HomePageState extends State<HomePage> {
                     foregroundColor: Colors.black,
                     onPressed: () {
                       if (_currentPosition != null) {
+                        _userHasInteracted = false; // Reset flag to allow auto-centering again
                         _mapController.move(_currentPosition!, _currentZoom);
                         debugPrint('🎯 Centered map to current location');
                       }
