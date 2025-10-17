@@ -395,14 +395,11 @@ class _HomePageState extends State<HomePage> {
                     onTap: (tapPosition, point) {
                       _userHasInteracted = true;
                     },
-                    onPointerDown: (event) {
+                    onPointerDown: (event, point) {
                       _userHasInteracted = true;
                     },
-                    onMapEvent: (event) {
-                      // Detect manual zoom or pan interactions
-                      if (event is MapEventMove || event is MapEventMoveStart || event is MapEventMoveEnd) {
-                        _userHasInteracted = true;
-                      }
+                    onPointerUp: (event, point) {
+                      _userHasInteracted = true;
                     },
                   ),
                   children: [
