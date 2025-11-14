@@ -331,7 +331,9 @@ class _HomePageState extends State<HomePage> {
 
   void _onConnectivity(List<ConnectivityResult> results) {
     // Take the first connectivity result (most common case)
-    _connectivityStatus = results.isNotEmpty ? results.first : ConnectivityResult.none;
+    _connectivityStatus = results.isNotEmpty
+        ? results.first
+        : ConnectivityResult.none;
   }
 
   // ======================
@@ -487,6 +489,11 @@ class _HomePageState extends State<HomePage> {
           : null,
       "connectivity": _connectivityStatus.toString(),
       "timestamp": DateTime.now().toIso8601String(),
+      "turnAhead": _turnInfo?['exists'] ?? false,
+      "turnType": _turnInfo?['type'],
+      "turnDistance": _turnInfo?['distance'],
+      "intersectionLat": _turnInfo?['intersectionLat'],
+      "intersectionLng": _turnInfo?['intersectionLng'],
     };
 
     debugPrint("📤 Sending WebSocket data...");
@@ -593,7 +600,7 @@ class _HomePageState extends State<HomePage> {
     final lon = _fusedPosition!.longitude;
 
     // Overpass query: get all nearby highway ways excluding steps, with geometry
-    // Includes: motorways, primary, secondary, tertiary, residential, service, 
+    // Includes: motorways, primary, secondary, tertiary, residential, service,
     // cycleways, tracks, etc.
     final query =
         """[out:json];
@@ -612,7 +619,7 @@ out geom;""";
       try {
         final url = Uri.parse("$server?data=${Uri.encodeComponent(query)}");
         final res = await http.get(url).timeout(const Duration(seconds: 10));
-        
+
         if (res.statusCode == 200) {
           data = jsonDecode(res.body);
           if (data?['elements'] != null && data!['elements'].isNotEmpty) {
@@ -635,23 +642,25 @@ out geom;""";
     dynamic bestWay;
     int bestSegmentIndex = 0;
     double bestSegmentDist = double.infinity;
-    
+
     for (final el in data['elements']) {
       if (el['geometry'] == null) continue;
       final geom = el['geometry'] as List<dynamic>;
       if (geom.length < 2) continue;
-      
+
       // Convert to LatLng list
-      final points = geom.map((p) => LatLng(p['lat'] as double, p['lon'] as double)).toList();
-      
+      final points = geom
+          .map((p) => LatLng(p['lat'] as double, p['lon'] as double))
+          .toList();
+
       // Find the closest segment (line between two consecutive points)
       for (int i = 0; i < points.length - 1; i++) {
         final p1 = points[i];
         final p2 = points[i + 1];
-        
+
         // Calculate distance from user to the segment
         final distToSegment = _distanceToSegment(lat, lon, p1, p2);
-        
+
         if (distToSegment < bestSegmentDist) {
           bestSegmentDist = distToSegment;
           bestWay = el;
@@ -669,12 +678,14 @@ out geom;""";
     if (geom.length < 3) return null;
 
     // Convert to LatLng list
-    final points = geom.map((p) => LatLng(p['lat'] as double, p['lon'] as double)).toList();
+    final points = geom
+        .map((p) => LatLng(p['lat'] as double, p['lon'] as double))
+        .toList();
 
     // Look ahead 2-3 nodes from the current segment
     // We're at segment [bestSegmentIndex, bestSegmentIndex+1]
     // Look ahead to segments [bestSegmentIndex+1, bestSegmentIndex+2] and [bestSegmentIndex+2, bestSegmentIndex+3]
-    
+
     int startIndex = bestSegmentIndex;
     if (startIndex + 3 >= points.length) {
       // Not enough points ahead
@@ -682,7 +693,11 @@ out geom;""";
     }
 
     // Check the next 2-3 segments for angle changes
-    for (int offset = 0; offset <= 1 && (startIndex + offset + 2) < points.length; offset++) {
+    for (
+      int offset = 0;
+      offset <= 1 && (startIndex + offset + 2) < points.length;
+      offset++
+    ) {
       final p1 = points[startIndex + offset];
       final p2 = points[startIndex + offset + 1];
       final p3 = points[startIndex + offset + 2];
@@ -700,8 +715,16 @@ out geom;""";
       // Check if this is a significant turn (>= 20 degrees) within 10m
       if (angleChange.abs() >= 20.0 && distToTurn <= 10.0) {
         final type = angleChange > 0 ? 'right' : 'left';
-        debugPrint('🔄 Turn detected: $type turn, ${angleChange.toStringAsFixed(1)}°, ${distToTurn.toStringAsFixed(1)}m away');
-        return {"exists": true, "type": type, "distance": distToTurn};
+        debugPrint(
+          '🔄 Turn detected: $type turn, ${angleChange.toStringAsFixed(1)}°, ${distToTurn.toStringAsFixed(1)}m away',
+        );
+        return {
+          "exists": true,
+          "type": type,
+          "distance": distToTurn,
+          "intersectionLat": p2.latitude,
+          "intersectionLng": p2.longitude,
+        };
       }
     }
 
@@ -709,7 +732,12 @@ out geom;""";
     // Return the distance to the next turn point for reference
     if (startIndex + 2 < points.length) {
       final nextPoint = points[startIndex + 2];
-      final distToNext = _distance(lat, lon, nextPoint.latitude, nextPoint.longitude);
+      final distToNext = _distance(
+        lat,
+        lon,
+        nextPoint.latitude,
+        nextPoint.longitude,
+      );
       return {"exists": false, "distance": distToNext};
     }
 
@@ -717,7 +745,12 @@ out geom;""";
   }
 
   // Helper function to calculate distance from a point to a line segment
-  double _distanceToSegment(double lat, double lon, LatLng segStart, LatLng segEnd) {
+  double _distanceToSegment(
+    double lat,
+    double lon,
+    LatLng segStart,
+    LatLng segEnd,
+  ) {
     // Convert to radians for calculations
     final lat1 = segStart.latitude * pi / 180;
     final lon1 = segStart.longitude * pi / 180;
@@ -728,7 +761,12 @@ out geom;""";
 
     // Calculate distance from point to line segment using cross-track distance
     final d13 = _distance(segStart.latitude, segStart.longitude, lat, lon);
-    final d12 = _distance(segStart.latitude, segStart.longitude, segEnd.latitude, segEnd.longitude);
+    final d12 = _distance(
+      segStart.latitude,
+      segStart.longitude,
+      segEnd.latitude,
+      segEnd.longitude,
+    );
     final d23 = _distance(segEnd.latitude, segEnd.longitude, lat, lon);
 
     // If segment is very short, just use distance to nearest endpoint
@@ -1164,6 +1202,14 @@ out geom;""";
                             _turnInfo != null && _turnInfo!['distance'] != null
                                 ? "${(_turnInfo!['distance'] as double).toStringAsFixed(1)} meters"
                                 : 'N/A',
+                          ),
+                          _buildDataItem(
+                            'Intersection Lat',
+                            _turnInfo?['intersectionLat']?.toString() ?? 'N/A',
+                          ),
+                          _buildDataItem(
+                            'Intersection Lng',
+                            _turnInfo?['intersectionLng']?.toString() ?? 'N/A',
                           ),
                           const SizedBox(height: 16),
                           // Action Buttons
