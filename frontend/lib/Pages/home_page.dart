@@ -32,7 +32,7 @@ class _HomePageState extends State<HomePage> {
   bool _usingGpsCourse = false;
   // User calibration offset, applied to heading (degrees, can be negative)
   double _calibrationOffsetDeg = -42.0;
-  
+
   // Threat markers rendered as red dots
   List<Marker> _threatMarkers = [];
 
@@ -59,16 +59,22 @@ class _HomePageState extends State<HomePage> {
 
   Map<String, dynamic>? user;
   bool isLoading = true;
-  
+
   // Status indicators
   bool _isConnected = false;
   bool _isSendingData = false;
   DateTime? _lastDataSent;
   String _connectionStatus = 'Connecting...';
-  
+
   // Data viewer
   bool _showDataViewer = false;
   Map<String, dynamic>? _lastSentData;
+
+  // Turn detection state (frontend only)
+  Map<String, dynamic>?
+  _turnInfo; // { exists: bool, type: 'left'|'right', distance: double }
+  DateTime? _lastTurnCheckTime;
+  LatLng? _lastTurnCheckPosition;
 
   @override
   void initState() {
@@ -83,7 +89,6 @@ class _HomePageState extends State<HomePage> {
       // Using fixed calibration set in code
     });
   }
-
 
   Future<void> fetchUserProfile() async {
     print("fetchUserProfile: started");
@@ -152,14 +157,14 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _initLocation() async {
     debugPrint("📍 Initializing location services...");
-    
+
     bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
     debugPrint("📍 Location service enabled: $serviceEnabled");
     if (!serviceEnabled) {
       debugPrint("⚠️ Location services disabled.");
       return;
     }
-    
+
     LocationPermission permission = await Geolocator.requestPermission();
     debugPrint("📍 Location permission: $permission");
     if (permission == LocationPermission.denied ||
@@ -183,10 +188,10 @@ class _HomePageState extends State<HomePage> {
 
   void _updatePosition(Position pos, {bool initial = false}) {
     _currentPosition = LatLng(pos.latitude, pos.longitude);
-    
+
     // For web, use GPS directly without fusion to avoid drift
     _fusedPosition = _currentPosition;
-    
+
     // Only auto-center the map during initial location fetch or if user hasn't interacted yet
     try {
       if (mounted && (initial || !_userHasInteracted)) {
@@ -214,6 +219,10 @@ class _HomePageState extends State<HomePage> {
 
     // Skip fusion on web to prevent location drift
     // _applyFusion(pos);
+
+    // Trigger a turn-check when position changes significantly (rate-limited)
+    _maybeScheduleTurnCheck();
+
     setState(() {});
   }
 
@@ -316,12 +325,13 @@ class _HomePageState extends State<HomePage> {
 
   void _initConnectivity() {
     final conn = Connectivity();
-    conn.checkConnectivity().then((res) => _onConnectivity(res));
+    conn.checkConnectivity().then((results) => _onConnectivity(results));
     _connectivityStream = conn.onConnectivityChanged.listen(_onConnectivity);
   }
 
   void _onConnectivity(List<ConnectivityResult> results) {
-    _connectivityStatus = results.first;
+    // Take the first connectivity result (most common case)
+    _connectivityStatus = results.isNotEmpty ? results.first : ConnectivityResult.none;
   }
 
   // ======================
@@ -350,7 +360,7 @@ class _HomePageState extends State<HomePage> {
             _connectionStatus = 'Connected';
           });
         },
-      
+
         onDone: () {
           debugPrint('ℹ️ WebSocket closed - attempting to reconnect...');
           setState(() {
@@ -371,8 +381,10 @@ class _HomePageState extends State<HomePage> {
 
       // Start sending data every second
       _sendTimer?.cancel();
-      _sendTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      _sendTimer = Timer.periodic(const Duration(seconds: 1), (_) async {
         _sendWebSocket();
+        // run a rate-limited turn check on the frontend (does not send to backend)
+        await _checkTurnAhead();
       });
 
       debugPrint('✅ WebSocket connected successfully');
@@ -403,10 +415,10 @@ class _HomePageState extends State<HomePage> {
       final bool isThreatsType = payload is Map && payload['type'] == 'threats';
       final List<dynamic> positions =
           (payload is Map && payload['positions'] is List)
-              ? (payload['positions'] as List)
-              : (payload is Map && payload['threats'] is List)
-                  ? (payload['threats'] as List)
-                  : const [];
+          ? (payload['positions'] as List)
+          : (payload is Map && payload['threats'] is List)
+          ? (payload['threats'] as List)
+          : const [];
 
       if (isThreatsType || positions.isNotEmpty) {
         final List<Marker> markers = [];
@@ -421,11 +433,7 @@ class _HomePageState extends State<HomePage> {
               point: LatLng(latNum.toDouble(), lngNum.toDouble()),
               width: 18,
               height: 18,
-              child: const Icon(
-                Icons.circle,
-                color: Colors.red,
-                size: 12,
-              ),
+              child: const Icon(Icons.circle, color: Colors.red, size: 12),
             ),
           );
         }
@@ -454,9 +462,11 @@ class _HomePageState extends State<HomePage> {
       debugPrint('User object: $user');
       return;
     }
-    
+
     debugPrint('👤 User ID: ${user!['_id']}');
-    debugPrint('🌍 Position: ${_fusedPosition!.latitude}, ${_fusedPosition!.longitude}');
+    debugPrint(
+      '🌍 Position: ${_fusedPosition!.latitude}, ${_fusedPosition!.longitude}',
+    );
 
     // WebSocket connection will be checked in the try-catch block below
 
@@ -486,15 +496,15 @@ class _HomePageState extends State<HomePage> {
       setState(() {
         _isSendingData = true;
       });
-      
+
       _ws!.sink.add(jsonEncode(payload));
       _lastDataSent = DateTime.now();
       _lastSentData = payload; // Store the data for viewing
-      
+
       setState(() {
         _isSendingData = false;
       });
-      
+
       debugPrint("✅ Data sent successfully at ${DateTime.now()}");
     } catch (e) {
       setState(() {
@@ -518,6 +528,253 @@ class _HomePageState extends State<HomePage> {
     _sendTimer?.cancel();
     _ws?.sink.close();
     super.dispose();
+  }
+
+  // -----------------
+  // Turn detection helpers
+  // -----------------
+
+  double _distance(double lat1, double lon1, double lat2, double lon2) {
+    const R = 6371000; // meters
+    final dLat = (lat2 - lat1) * pi / 180;
+    final dLon = (lon2 - lon1) * pi / 180;
+
+    final a =
+        sin(dLat / 2) * sin(dLat / 2) +
+        cos(lat1 * pi / 180) *
+            cos(lat2 * pi / 180) *
+            sin(dLon / 2) *
+            sin(dLon / 2);
+
+    return R * 2 * atan2(sqrt(a), sqrt(1 - a));
+  }
+
+  double _bearing(LatLng a, LatLng b) {
+    final lat1 = a.latitude * pi / 180;
+    final lat2 = b.latitude * pi / 180;
+    final dLon = (b.longitude - a.longitude) * pi / 180;
+
+    final y = sin(dLon) * cos(lat2);
+    final x = cos(lat1) * sin(lat2) - sin(lat1) * cos(lat2) * cos(dLon);
+
+    return (atan2(y, x) * 180 / pi + 360) % 360;
+  }
+
+  // Rate-limited check: only run overpass if position changed by >= 1m or >2s since last check
+  Future<void> _maybeScheduleTurnCheck() async {
+    try {
+      final now = DateTime.now();
+      if (_fusedPosition == null) return;
+      if (_lastTurnCheckTime != null) {
+        final dt = now.difference(_lastTurnCheckTime!).inMilliseconds;
+        final moved = _lastTurnCheckPosition == null
+            ? double.infinity
+            : _distance(
+                _fusedPosition!.latitude,
+                _fusedPosition!.longitude,
+                _lastTurnCheckPosition!.latitude,
+                _lastTurnCheckPosition!.longitude,
+              );
+        if (dt < 1500 && moved < 1.0) {
+          // too soon and not moved enough
+          return;
+        }
+      }
+      await _checkTurnAhead();
+    } catch (e) {
+      debugPrint('❌ Turn check failed: $e');
+    }
+  }
+
+  Future<Map<String, dynamic>?> _detectTurnAhead() async {
+    if (_fusedPosition == null) return null;
+
+    final lat = _fusedPosition!.latitude;
+    final lon = _fusedPosition!.longitude;
+
+    // Overpass query: get all nearby highway ways excluding steps, with geometry
+    // Includes: motorways, primary, secondary, tertiary, residential, service, 
+    // cycleways, tracks, etc.
+    final query =
+        """[out:json];
+way["highway"]["highway"!="steps"](around:30,$lat,$lon);
+out geom;""";
+
+    // Try multiple Overpass servers for reliability
+    final List<String> overpassServers = [
+      "https://overpass-api.de/api/interpreter",
+      "https://overpass.kumi.systems/api/interpreter",
+      "https://overpass.openstreetmap.ru/api/interpreter",
+    ];
+
+    Map<String, dynamic>? data;
+    for (final server in overpassServers) {
+      try {
+        final url = Uri.parse("$server?data=${Uri.encodeComponent(query)}");
+        final res = await http.get(url).timeout(const Duration(seconds: 10));
+        
+        if (res.statusCode == 200) {
+          data = jsonDecode(res.body);
+          if (data?['elements'] != null && data!['elements'].isNotEmpty) {
+            debugPrint('✅ Overpass query succeeded from $server');
+            break;
+          }
+        }
+      } catch (e) {
+        debugPrint('⚠️ Overpass server $server failed: $e');
+        continue;
+      }
+    }
+
+    if (data == null || data['elements'] == null || data['elements'].isEmpty) {
+      debugPrint('⚠️ No OSM ways found nearby');
+      return null;
+    }
+
+    // Find the way with the closest segment to the user's position
+    dynamic bestWay;
+    int bestSegmentIndex = 0;
+    double bestSegmentDist = double.infinity;
+    
+    for (final el in data['elements']) {
+      if (el['geometry'] == null) continue;
+      final geom = el['geometry'] as List<dynamic>;
+      if (geom.length < 2) continue;
+      
+      // Convert to LatLng list
+      final points = geom.map((p) => LatLng(p['lat'] as double, p['lon'] as double)).toList();
+      
+      // Find the closest segment (line between two consecutive points)
+      for (int i = 0; i < points.length - 1; i++) {
+        final p1 = points[i];
+        final p2 = points[i + 1];
+        
+        // Calculate distance from user to the segment
+        final distToSegment = _distanceToSegment(lat, lon, p1, p2);
+        
+        if (distToSegment < bestSegmentDist) {
+          bestSegmentDist = distToSegment;
+          bestWay = el;
+          bestSegmentIndex = i;
+        }
+      }
+    }
+
+    if (bestWay == null) {
+      debugPrint('⚠️ No suitable way found');
+      return null;
+    }
+
+    final geom = bestWay['geometry'] as List<dynamic>;
+    if (geom.length < 3) return null;
+
+    // Convert to LatLng list
+    final points = geom.map((p) => LatLng(p['lat'] as double, p['lon'] as double)).toList();
+
+    // Look ahead 2-3 nodes from the current segment
+    // We're at segment [bestSegmentIndex, bestSegmentIndex+1]
+    // Look ahead to segments [bestSegmentIndex+1, bestSegmentIndex+2] and [bestSegmentIndex+2, bestSegmentIndex+3]
+    
+    int startIndex = bestSegmentIndex;
+    if (startIndex + 3 >= points.length) {
+      // Not enough points ahead
+      return null;
+    }
+
+    // Check the next 2-3 segments for angle changes
+    for (int offset = 0; offset <= 1 && (startIndex + offset + 2) < points.length; offset++) {
+      final p1 = points[startIndex + offset];
+      final p2 = points[startIndex + offset + 1];
+      final p3 = points[startIndex + offset + 2];
+
+      final b1 = _bearing(p1, p2);
+      final b2 = _bearing(p2, p3);
+
+      double angleChange = b2 - b1;
+      // Normalize to -180..180
+      if (angleChange > 180) angleChange -= 360;
+      if (angleChange < -180) angleChange += 360;
+
+      final distToTurn = _distance(lat, lon, p2.latitude, p2.longitude);
+
+      // Check if this is a significant turn (>= 20 degrees) within 10m
+      if (angleChange.abs() >= 20.0 && distToTurn <= 10.0) {
+        final type = angleChange > 0 ? 'right' : 'left';
+        debugPrint('🔄 Turn detected: $type turn, ${angleChange.toStringAsFixed(1)}°, ${distToTurn.toStringAsFixed(1)}m away');
+        return {"exists": true, "type": type, "distance": distToTurn};
+      }
+    }
+
+    // No significant turn found within 10m
+    // Return the distance to the next turn point for reference
+    if (startIndex + 2 < points.length) {
+      final nextPoint = points[startIndex + 2];
+      final distToNext = _distance(lat, lon, nextPoint.latitude, nextPoint.longitude);
+      return {"exists": false, "distance": distToNext};
+    }
+
+    return null;
+  }
+
+  // Helper function to calculate distance from a point to a line segment
+  double _distanceToSegment(double lat, double lon, LatLng segStart, LatLng segEnd) {
+    // Convert to radians for calculations
+    final lat1 = segStart.latitude * pi / 180;
+    final lon1 = segStart.longitude * pi / 180;
+    final lat2 = segEnd.latitude * pi / 180;
+    final lon2 = segEnd.longitude * pi / 180;
+    final lat0 = lat * pi / 180;
+    final lon0 = lon * pi / 180;
+
+    // Calculate distance from point to line segment using cross-track distance
+    final d13 = _distance(segStart.latitude, segStart.longitude, lat, lon);
+    final d12 = _distance(segStart.latitude, segStart.longitude, segEnd.latitude, segEnd.longitude);
+    final d23 = _distance(segEnd.latitude, segEnd.longitude, lat, lon);
+
+    // If segment is very short, just use distance to nearest endpoint
+    if (d12 < 0.1) {
+      return d13 < d23 ? d13 : d23;
+    }
+
+    // Calculate bearing from segStart to segEnd and from segStart to point
+    final brng12 = _bearing(segStart, segEnd) * pi / 180;
+    final brng13 = _bearing(segStart, LatLng(lat, lon)) * pi / 180;
+
+    // Cross-track distance
+    final dxt = asin(sin(d13 / 6371000) * sin(brng13 - brng12)) * 6371000;
+
+    // Check if the point projects onto the segment
+    final dAlong = d13 * cos(brng13 - brng12);
+    if (dAlong < 0 || dAlong > d12) {
+      // Point projects outside segment, use distance to nearest endpoint
+      return d13 < d23 ? d13 : d23;
+    }
+
+    return dxt.abs();
+  }
+
+  Future<void> _checkTurnAhead() async {
+    try {
+      final now = DateTime.now();
+      final result = await _detectTurnAhead();
+      _lastTurnCheckTime = now;
+      _lastTurnCheckPosition = _fusedPosition;
+
+      if (mounted) {
+        setState(() {
+          // Always set turnInfo, even if null (will show as false/None/N/A in UI)
+          _turnInfo = result ?? {"exists": false, "distance": null};
+        });
+      }
+    } catch (e) {
+      debugPrint('❌ _checkTurnAhead error: $e');
+      // On error, set to no turn detected
+      if (mounted) {
+        setState(() {
+          _turnInfo = {"exists": false, "distance": null};
+        });
+      }
+    }
   }
 
   @override
@@ -549,7 +806,10 @@ class _HomePageState extends State<HomePage> {
                         children: [
                           // Connection Status
                           Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 8,
+                              vertical: 4,
+                            ),
                             decoration: BoxDecoration(
                               color: _isConnected ? Colors.green : Colors.red,
                               borderRadius: BorderRadius.circular(12),
@@ -578,7 +838,10 @@ class _HomePageState extends State<HomePage> {
                           // Data Transmission Indicator
                           if (_isSendingData)
                             Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 8,
+                                vertical: 4,
+                              ),
                               decoration: BoxDecoration(
                                 color: Colors.blue,
                                 borderRadius: BorderRadius.circular(12),
@@ -591,7 +854,9 @@ class _HomePageState extends State<HomePage> {
                                     height: 12,
                                     child: CircularProgressIndicator(
                                       strokeWidth: 2,
-                                      valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                                      valueColor: AlwaysStoppedAnimation<Color>(
+                                        Colors.white,
+                                      ),
                                     ),
                                   ),
                                   SizedBox(width: 4),
@@ -610,7 +875,10 @@ class _HomePageState extends State<HomePage> {
                           // User Info
                           if (user != null)
                             Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 8,
+                                vertical: 4,
+                              ),
                               decoration: BoxDecoration(
                                 color: Colors.white.withOpacity(0.2),
                                 borderRadius: BorderRadius.circular(12),
@@ -628,7 +896,10 @@ class _HomePageState extends State<HomePage> {
                           // Last Data Sent
                           if (_lastDataSent != null)
                             Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 8,
+                                vertical: 4,
+                              ),
                               decoration: BoxDecoration(
                                 color: Colors.green.withOpacity(0.8),
                                 borderRadius: BorderRadius.circular(12),
@@ -645,7 +916,10 @@ class _HomePageState extends State<HomePage> {
                           const SizedBox(width: 8),
                           // Heading Indicator (fixed calibration; controls removed)
                           Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 8,
+                              vertical: 4,
+                            ),
                             decoration: BoxDecoration(
                               color: Colors.orange.withOpacity(0.9),
                               borderRadius: BorderRadius.circular(12),
@@ -653,7 +927,11 @@ class _HomePageState extends State<HomePage> {
                             child: Row(
                               mainAxisSize: MainAxisSize.min,
                               children: [
-                                const Icon(Icons.explore, color: Colors.white, size: 14),
+                                const Icon(
+                                  Icons.explore,
+                                  color: Colors.white,
+                                  size: 14,
+                                ),
                                 const SizedBox(width: 4),
                                 Text(
                                   '${_displayHeadingDeg.toStringAsFixed(0)}° ${_usingGpsCourse ? 'gps' : (_hasCompassHeading ? 'compass' : 'n/a')} (+42°)',
@@ -690,39 +968,37 @@ class _HomePageState extends State<HomePage> {
                         _userHasInteracted = true;
                       },
                     ),
-                  children: [
-                    TileLayer(
-                      urlTemplate:
-                          "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-                      userAgentPackageName: 'com.example.frontend',
-                    ),
-                    MarkerLayer(
-                      markers: [
-                        Marker(
-                          point: _currentPosition!,
-                          width: 60,
-                          height: 60,
-                          rotate: false,
-                          child: AnimatedRotation(
-                            turns: ((_displayHeadingDeg % 360) / 360),
-                            duration: const Duration(milliseconds: 150),
-                            curve: Curves.easeOut,
-                            child: const Icon(
-                              Icons.navigation,
-                              color: Colors.blue,
-                              size: 45,
+                    children: [
+                      TileLayer(
+                        urlTemplate:
+                            "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+                        userAgentPackageName: 'com.example.frontend',
+                      ),
+                      MarkerLayer(
+                        markers: [
+                          Marker(
+                            point: _currentPosition!,
+                            width: 60,
+                            height: 60,
+                            rotate: false,
+                            child: AnimatedRotation(
+                              turns: ((_displayHeadingDeg % 360) / 360),
+                              duration: const Duration(milliseconds: 150),
+                              curve: Curves.easeOut,
+                              child: const Icon(
+                                Icons.navigation,
+                                color: Colors.blue,
+                                size: 45,
+                              ),
                             ),
                           ),
-                        ),
-                      ],
-                    ),
-                    // Threat markers layer (red dots)
-                    if (_threatMarkers.isNotEmpty)
-                      MarkerLayer(
-                        markers: _threatMarkers,
+                        ],
                       ),
-                  ],
-                ),
+                      // Threat markers layer (red dots)
+                      if (_threatMarkers.isNotEmpty)
+                        MarkerLayer(markers: _threatMarkers),
+                    ],
+                  ),
                 ),
                 // My Location Button
                 Positioned(
@@ -733,7 +1009,8 @@ class _HomePageState extends State<HomePage> {
                     foregroundColor: Colors.black,
                     onPressed: () {
                       if (_currentPosition != null) {
-                        _userHasInteracted = false; // Reset flag to allow auto-centering again
+                        _userHasInteracted =
+                            false; // Reset flag to allow auto-centering again
                         _mapController.move(_currentPosition!, _currentZoom);
                         debugPrint('🎯 Centered map to current location');
                       }
@@ -746,14 +1023,20 @@ class _HomePageState extends State<HomePage> {
                   bottom: 90,
                   right: 20,
                   child: FloatingActionButton(
-                    backgroundColor: _showDataViewer ? Colors.blue : Colors.white,
-                    foregroundColor: _showDataViewer ? Colors.white : Colors.black,
+                    backgroundColor: _showDataViewer
+                        ? Colors.blue
+                        : Colors.white,
+                    foregroundColor: _showDataViewer
+                        ? Colors.white
+                        : Colors.black,
                     onPressed: () {
                       setState(() {
                         _showDataViewer = !_showDataViewer;
                       });
                     },
-                    child: Icon(_showDataViewer ? Icons.close : Icons.data_usage),
+                    child: Icon(
+                      _showDataViewer ? Icons.close : Icons.data_usage,
+                    ),
                   ),
                 ),
                 // Data Viewer Overlay
@@ -799,33 +1082,89 @@ class _HomePageState extends State<HomePage> {
                                     _showDataViewer = false;
                                   });
                                 },
-                                icon: const Icon(Icons.close, color: Colors.white),
+                                icon: const Icon(
+                                  Icons.close,
+                                  color: Colors.white,
+                                ),
                               ),
                             ],
                           ),
                           const SizedBox(height: 12),
                           // Data Content
                           if (_lastSentData != null) ...[
-                            _buildDataItem('User ID', _lastSentData!['userId']?.toString() ?? 'N/A'),
-                            _buildDataItem('Latitude', _lastSentData!['latitude']?.toString() ?? 'N/A'),
-                            _buildDataItem('Longitude', _lastSentData!['longitude']?.toString() ?? 'N/A'),
-                            _buildDataItem('Speed', _lastSentData!['speed']?.toString() ?? 'N/A'),
-                            _buildDataItem('Heading', _lastSentData!['heading']?.toString() ?? 'N/A'),
-                            _buildDataItem('Connectivity', _lastSentData!['connectivity']?.toString() ?? 'N/A'),
-                            _buildDataItem('Timestamp', _lastSentData!['timestamp']?.toString() ?? 'N/A'),
+                            _buildDataItem(
+                              'User ID',
+                              _lastSentData!['userId']?.toString() ?? 'N/A',
+                            ),
+                            _buildDataItem(
+                              'Latitude',
+                              _lastSentData!['latitude']?.toString() ?? 'N/A',
+                            ),
+                            _buildDataItem(
+                              'Longitude',
+                              _lastSentData!['longitude']?.toString() ?? 'N/A',
+                            ),
+                            _buildDataItem(
+                              'Speed',
+                              _lastSentData!['speed']?.toString() ?? 'N/A',
+                            ),
+                            _buildDataItem(
+                              'Heading',
+                              _lastSentData!['heading']?.toString() ?? 'N/A',
+                            ),
+                            _buildDataItem(
+                              'Connectivity',
+                              _lastSentData!['connectivity']?.toString() ??
+                                  'N/A',
+                            ),
+                            _buildDataItem(
+                              'Timestamp',
+                              _lastSentData!['timestamp']?.toString() ?? 'N/A',
+                            ),
                             // Sensor data
                             if (_lastSentData!['accel'] != null)
-                              _buildDataItem('Accelerometer', 'X: ${_lastSentData!['accel']['x']?.toStringAsFixed(2)}, Y: ${_lastSentData!['accel']['y']?.toStringAsFixed(2)}, Z: ${_lastSentData!['accel']['z']?.toStringAsFixed(2)}'),
+                              _buildDataItem(
+                                'Accelerometer',
+                                'X: ${_lastSentData!['accel']['x']?.toStringAsFixed(2)}, Y: ${_lastSentData!['accel']['y']?.toStringAsFixed(2)}, Z: ${_lastSentData!['accel']['z']?.toStringAsFixed(2)}',
+                              ),
                             if (_lastSentData!['gyro'] != null)
-                              _buildDataItem('Gyroscope', 'X: ${_lastSentData!['gyro']['x']?.toStringAsFixed(4)}, Y: ${_lastSentData!['gyro']['y']?.toStringAsFixed(4)}, Z: ${_lastSentData!['gyro']['z']?.toStringAsFixed(4)}'),
+                              _buildDataItem(
+                                'Gyroscope',
+                                'X: ${_lastSentData!['gyro']['x']?.toStringAsFixed(4)}, Y: ${_lastSentData!['gyro']['y']?.toStringAsFixed(4)}, Z: ${_lastSentData!['gyro']['z']?.toStringAsFixed(4)}',
+                              ),
                             if (_lastSentData!['magnetometer'] != null)
-                              _buildDataItem('Magnetometer', 'X: ${_lastSentData!['magnetometer']['x']?.toStringAsFixed(2)}, Y: ${_lastSentData!['magnetometer']['y']?.toStringAsFixed(2)}, Z: ${_lastSentData!['magnetometer']['z']?.toStringAsFixed(2)}'),
+                              _buildDataItem(
+                                'Magnetometer',
+                                'X: ${_lastSentData!['magnetometer']['x']?.toStringAsFixed(2)}, Y: ${_lastSentData!['magnetometer']['y']?.toStringAsFixed(2)}, Z: ${_lastSentData!['magnetometer']['z']?.toStringAsFixed(2)}',
+                              ),
                           ] else ...[
                             const Text(
                               'No data sent yet',
                               style: TextStyle(color: Colors.grey),
                             ),
                           ],
+                          const SizedBox(height: 12),
+                          // Turn info display (frontend only)
+                          const Divider(color: Colors.white12),
+                          const SizedBox(height: 8),
+                          _buildDataItem(
+                            'Turn Ahead',
+                            _turnInfo != null && _turnInfo!['exists'] == true
+                                ? 'true'
+                                : 'false',
+                          ),
+                          _buildDataItem(
+                            'Turn Type',
+                            _turnInfo != null && _turnInfo!['exists'] == true
+                                ? (_turnInfo!['type']?.toString() ?? 'None')
+                                : 'None',
+                          ),
+                          _buildDataItem(
+                            'Turn Distance',
+                            _turnInfo != null && _turnInfo!['distance'] != null
+                                ? "${(_turnInfo!['distance'] as double).toStringAsFixed(1)} meters"
+                                : 'N/A',
+                          ),
                           const SizedBox(height: 16),
                           // Action Buttons
                           Row(
@@ -839,7 +1178,9 @@ class _HomePageState extends State<HomePage> {
                                     });
                                     ScaffoldMessenger.of(context).showSnackBar(
                                       const SnackBar(
-                                        content: Text('Data cleared from display'),
+                                        content: Text(
+                                          'Data cleared from display',
+                                        ),
                                         backgroundColor: Colors.green,
                                       ),
                                     );
@@ -859,9 +1200,13 @@ class _HomePageState extends State<HomePage> {
                                     // Copy data to clipboard
                                     if (_lastSentData != null) {
                                       // You can implement clipboard functionality here
-                                      ScaffoldMessenger.of(context).showSnackBar(
+                                      ScaffoldMessenger.of(
+                                        context,
+                                      ).showSnackBar(
                                         const SnackBar(
-                                          content: Text('Data copied to clipboard'),
+                                          content: Text(
+                                            'Data copied to clipboard',
+                                          ),
                                           backgroundColor: Colors.blue,
                                         ),
                                       );
@@ -906,10 +1251,7 @@ class _HomePageState extends State<HomePage> {
           Expanded(
             child: Text(
               value,
-              style: const TextStyle(
-                color: Colors.white,
-                fontSize: 12,
-              ),
+              style: const TextStyle(color: Colors.white, fontSize: 12),
             ),
           ),
         ],
