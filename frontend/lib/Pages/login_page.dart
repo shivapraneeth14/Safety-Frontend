@@ -14,6 +14,7 @@ class _LoginPageState extends State<LoginPage> {
   final _formKey = GlobalKey<FormState>();
   String loginname = '', password = '';
   bool loading = false;
+  bool obscurePassword = true; // 👈 for eye toggle
 
   Future<void> loginUser() async {
     setState(() => loading = true);
@@ -30,63 +31,124 @@ class _LoginPageState extends State<LoginPage> {
     await prefs.setString("accessToken", data['accessToken']);
     await prefs.setString("refreshToken", data['refreshToken']);
 
-    print("Saved AccessToken: ${prefs.getString("accessToken")}");
-
     if (response.statusCode == 200) {
       Navigator.pushReplacementNamed(context, '/home');
     } else {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(data['message'] ?? 'Error')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(data['message'] ?? 'Error')),
+      );
     }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: Text("Login")),
-      body: Padding(
-        padding: EdgeInsets.all(16),
-        child: Column(
-          children: [
-            Form(
-              key: _formKey,
-              child: Column(
-                children: [
-                  TextFormField(
-                    decoration: InputDecoration(labelText: "Username or Email"),
-                    onChanged: (val) => loginname = val,
-                    validator: (val) =>
-                        val!.isEmpty ? "Enter username/email" : null,
-                  ),
-                  TextFormField(
-                    decoration: InputDecoration(labelText: "Password"),
-                    obscureText: true,
-                    onChanged: (val) => password = val,
-                    validator: (val) => val!.isEmpty ? "Enter password" : null,
-                  ),
-                  SizedBox(height: 20),
-                  loading
-                      ? CircularProgressIndicator()
-                      : ElevatedButton(
-                          onPressed: () {
-                            if (_formKey.currentState!.validate()) {
-                              loginUser();
-                            }
-                          },
-                          child: Text("Login"),
+      backgroundColor: Colors.grey[100],
+      body: Center(
+        child: SingleChildScrollView(
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: Card(
+              elevation: 8,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(16),
+              ),
+              child: Padding(
+                padding: const EdgeInsets.all(20),
+                child: Form(
+                  key: _formKey,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.lock_outline, size: 60),
+                      SizedBox(height: 10),
+                      Text(
+                        "Welcome Back",
+                        style: TextStyle(
+                          fontSize: 22,
+                          fontWeight: FontWeight.bold,
                         ),
-                ],
+                      ),
+                      SizedBox(height: 20),
+
+                      // Username
+                      TextFormField(
+                        decoration: InputDecoration(
+                          labelText: "Username or Email",
+                          prefixIcon: Icon(Icons.person_outline),
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                        ),
+                        onChanged: (val) => loginname = val,
+                        validator: (val) =>
+                            val!.isEmpty ? "Enter username/email" : null,
+                      ),
+
+                      SizedBox(height: 15),
+
+                      // Password with eye toggle
+                      TextFormField(
+                        obscureText: obscurePassword,
+                        decoration: InputDecoration(
+                          labelText: "Password",
+                          prefixIcon: Icon(Icons.lock_outline),
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          suffixIcon: IconButton(
+                            icon: Icon(obscurePassword
+                                ? Icons.visibility_off
+                                : Icons.visibility),
+                            onPressed: () {
+                              setState(() {
+                                obscurePassword = !obscurePassword;
+                              });
+                            },
+                          ),
+                        ),
+                        onChanged: (val) => password = val,
+                        validator: (val) =>
+                            val!.isEmpty ? "Enter password" : null,
+                      ),
+
+                      SizedBox(height: 20),
+
+                      // Login Button
+                      loading
+                          ? CircularProgressIndicator()
+                          : SizedBox(
+                              width: double.infinity,
+                              child: ElevatedButton(
+                                style: ElevatedButton.styleFrom(
+                                  padding: EdgeInsets.symmetric(vertical: 14),
+                                  shape: RoundedRectangleBorder(
+                                    borderRadius: BorderRadius.circular(10),
+                                  ),
+                                ),
+                                onPressed: () {
+                                  if (_formKey.currentState!.validate()) {
+                                    loginUser();
+                                  }
+                                },
+                                child: Text("Login"),
+                              ),
+                            ),
+
+                      SizedBox(height: 10),
+
+                      TextButton(
+                        onPressed: () {
+                          Navigator.pushReplacementNamed(context, '/signup');
+                        },
+                        child: Text("Don't have an account? Sign Up"),
+                      ),
+                    ],
+                  ),
+                ),
               ),
             ),
-            SizedBox(height: 20),
-            TextButton(
-              onPressed: () {
-                Navigator.pushReplacementNamed(context, '/signup');
-              },
-              child: Text("Don't have an account? Sign Up"),
-            ),
-          ],
+          ),
         ),
       ),
     );
