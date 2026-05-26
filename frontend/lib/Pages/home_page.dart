@@ -72,7 +72,7 @@ class _HomePageState extends State<HomePage> {
 
   // Turn detection state (frontend only)
   Map<String, dynamic>?
-  _turnInfo; // { exists, type, distance, intersectionLat, intersectionLng, availableTurns }
+  _turnInfo; // { exists, type, distance, intersectionLat, intersectionLng }
   DateTime? _lastTurnCheckTime;
   LatLng? _lastTurnCheckPosition;
 
@@ -686,45 +686,19 @@ out body geom;""";
 
     int startIndex = bestSegmentIndex;
 
-    // ─── PHASE 1: Immediate angle-based turn check (within 10m, original logic) ───
-    for (
-      int offset = 0;
-      offset <= 1 && (startIndex + offset + 2) < points.length;
-      offset++
-    ) {
-      final p1 = points[startIndex + offset];
-      final p2 = points[startIndex + offset + 1];
-      final p3 = points[startIndex + offset + 2];
+    // Determine which direction the vehicle is traveling along the way
+    final segBearing = _bearing(points[startIndex], points[startIndex + 1]);
+    double headingDiff = (_lastHeading ?? segBearing) - segBearing;
+    if (headingDiff > 180) headingDiff -= 360;
+    if (headingDiff < -180) headingDiff += 360;
+    final goingForward = headingDiff.abs() <= 90;
+    debugPrint('🧭 heading=$_lastHeading segBearing=${segBearing.toStringAsFixed(0)}° diff=${headingDiff.toStringAsFixed(0)}° goingForward=$goingForward');
 
-      final b1 = _bearing(p1, p2);
-      final b2 = _bearing(p2, p3);
-
-      double angleChange = b2 - b1;
-      if (angleChange > 180) angleChange -= 360;
-      if (angleChange < -180) angleChange += 360;
-
-      final distToTurn = _distance(lat, lon, p2.latitude, p2.longitude);
-
-      if (angleChange.abs() >= 20.0 && distToTurn <= 10.0) {
-        final type = angleChange > 0 ? 'right' : 'left';
-        debugPrint('🔄 Turn detected: $type turn, ${angleChange.toStringAsFixed(1)}°, ${distToTurn.toStringAsFixed(1)}m away');
-        return {
-          "exists": true,
-          "type": type,
-          "distance": distToTurn,
-          "intersectionLat": p2.latitude,
-          "intersectionLng": p2.longitude,
-          "availableTurns": [type],
-        };
-      }
-    }
-
-    // ─── PHASE 2: Junction scan 10m-50m (node shared with other ways) ───
-    // Only possible if node IDs are available (out body geom)
+    // ─── PHASE 1: Junction detection (node shared with other roads) ───
     if (nodes != null && nodes.isNotEmpty) {
-      // Build node-to-ways index from all returned elements
-      final bestWayId = bestWay['id'] as int;
+      // Build node-to-ways index
       final Map<int, List<int>> nodeToWays = {};
+      final bestWayId = bestWay['id'] as int;
       for (final el in data['elements']) {
         if (el['type'] != 'way' || el['nodes'] == null) continue;
         final wId = el['id'] as int;
@@ -741,26 +715,26 @@ out body geom;""";
         }
       }
 
-      // Scan nodes from 10m to 50m for junctions
-      for (int j = 0; j < nodes.length; j++) {
+      final int scanLimit = goingForward
+          ? (nodes.length < points.length ? nodes.length : points.length)
+          : 0;
+      final int scanStep = goingForward ? 1 : -1;
+
+      for (int j = startIndex; goingForward ? j < scanLimit : j >= scanLimit; j += scanStep) {
         final dist = _distance(lat, lon, points[j].latitude, points[j].longitude);
-        if (dist < 10) continue;
         if (dist > 50) break;
 
         final nodeId = nodes[j] as int;
         final waysHere = nodeToWays[nodeId] ?? [];
         if (waysHere.length <= 1) continue;
 
-        // Determine approach bearing (bearing into this junction)
-        final approach = _bearing(
-          points[j > 0 ? j - 1 : 0],
-          points[j],
-        );
+        // Approach bearing depends on travel direction
+        final approach = goingForward
+            ? _bearing(points[j > 0 ? j - 1 : 0], points[j])
+            : _bearing(points[j + 1 < points.length ? j + 1 : points.length - 1], points[j]);
 
-        // Collect available turn directions
-        final turns = <String>{};
-        if (j + 1 < points.length) turns.add("straight");
-
+        // Check each other way at this node
+        final sideRoads = <String>{};
         for (final otherId in waysHere) {
           if (otherId == bestWayId) continue;
           final otherGeom = otherGeoms[otherId];
@@ -771,8 +745,8 @@ out body geom;""";
             final og = otherGeom[k] as Map<String, dynamic>;
             final oLat = og['lat'] as double;
             final oLon = og['lon'] as double;
-            if ((oLat - points[j].latitude).abs() < 0.0001 &&
-                (oLon - points[j].longitude).abs() < 0.0001) {
+            if ((oLat - points[j].latitude).abs() < 0.00001 &&
+                (oLon - points[j].longitude).abs() < 0.00001) {
               otherIdx = k;
               break;
             }
@@ -783,73 +757,101 @@ out body geom;""";
           if (dirIdx < 0 || dirIdx >= otherGeom.length) continue;
 
           final ogDir = otherGeom[dirIdx] as Map<String, dynamic>;
-          final dLat = ogDir['lat'] as double;
-          final dLon = ogDir['lon'] as double;
           final brg = _bearing(
             points[j],
-            LatLng(dLat, dLon),
+            LatLng(ogDir['lat'] as double, ogDir['lon'] as double),
           );
 
           double diff = (brg - approach) % 360;
           if (diff > 180) diff -= 360;
 
           if (diff.abs() <= 30) {
-            turns.add("straight");
+            sideRoads.add("straight");
           } else if (diff > 30 && diff <= 150) {
-            turns.add("right");
+            sideRoads.add("right");
           } else if (diff < -30 && diff >= -150) {
-            turns.add("left");
+            sideRoads.add("left");
           }
         }
 
-        // Classify junction type
+        // Check if vehicle's own road continues past this node (in travel direction)
+        final hasStraight = goingForward
+            ? (j + 1 < points.length)
+            : (j > 0);
+        final dirs = Set<String>.from(sideRoads);
+        if (hasStraight) dirs.add("straight");
+
+        // Classify junction
         String type;
-        if (turns.contains("straight") && turns.length >= 3) {
+        if (dirs.contains("straight") && dirs.length >= 3) {
           type = "cross";
-        } else if (!turns.contains("straight") && turns.length >= 2) {
+        } else if (!dirs.contains("straight") && dirs.length >= 2) {
           type = "t_junction";
-        } else if (turns.length == 1 && turns.contains("straight")) {
-          // road continues but no side roads — skip as not a meaningful junction
+        } else if (dirs.length == 1 && dirs.contains("straight")) {
           continue;
+        } else if (dirs.length == 1) {
+          type = dirs.first == "left" ? "left_turn" : "right_turn";
         } else {
-          type = turns.first;
+          continue;
         }
 
-        debugPrint('🚧 Junction detected: $type at ${dist.toStringAsFixed(1)}m, turns: $turns');
+        debugPrint('🚧 $type at ${dist.toStringAsFixed(1)}m — $dirs');
         return {
           "exists": true,
           "type": type,
           "distance": dist,
           "intersectionLat": points[j].latitude,
           "intersectionLng": points[j].longitude,
-          "availableTurns": turns.toList(),
         };
       }
     }
 
-    // ─── PHASE 3: Extended angle scan 10m-50m (L-turn on same road, no junction) ───
-    for (int j = 0; j + 2 < points.length; j++) {
-      final dist = _distance(lat, lon, points[j + 1].latitude, points[j + 1].longitude);
-      if (dist < 10) continue;
-      if (dist > 50) break;
+    // ─── PHASE 2: Road bend detection (L-shape on same road) ───
+    if (goingForward) {
+      for (int j = startIndex; j + 2 < points.length; j++) {
+        final dist = _distance(lat, lon, points[j + 1].latitude, points[j + 1].longitude);
+        if (dist > 50) break;
 
-      final b1 = _bearing(points[j], points[j + 1]);
-      final b2 = _bearing(points[j + 1], points[j + 2]);
-      double angleChange = b2 - b1;
-      if (angleChange > 180) angleChange -= 360;
-      if (angleChange < -180) angleChange += 360;
+        final b1 = _bearing(points[j], points[j + 1]);
+        final b2 = _bearing(points[j + 1], points[j + 2]);
+        double angleChange = b2 - b1;
+        if (angleChange > 180) angleChange -= 360;
+        if (angleChange < -180) angleChange += 360;
 
-      if (angleChange.abs() >= 20.0) {
-        final type = angleChange > 0 ? 'right' : 'left';
-        debugPrint('🔄 Extended turn detected: $type at ${dist.toStringAsFixed(1)}m');
-        return {
-          "exists": true,
-          "type": type,
-          "distance": dist,
-          "intersectionLat": points[j + 1].latitude,
-          "intersectionLng": points[j + 1].longitude,
-          "availableTurns": [type],
-        };
+        if (angleChange.abs() >= 45.0) {
+          final type = angleChange > 0 ? "right_bend" : "left_bend";
+          debugPrint('↩️ $type at ${dist.toStringAsFixed(1)}m (angle: ${angleChange.toStringAsFixed(1)}°)');
+          return {
+            "exists": true,
+            "type": type,
+            "distance": dist,
+            "intersectionLat": points[j + 1].latitude,
+            "intersectionLng": points[j + 1].longitude,
+          };
+        }
+      }
+    } else {
+      for (int j = startIndex; j >= 2; j--) {
+        final dist = _distance(lat, lon, points[j - 1].latitude, points[j - 1].longitude);
+        if (dist > 50) break;
+
+        final b1 = _bearing(points[j], points[j - 1]);
+        final b2 = _bearing(points[j - 1], points[j - 2]);
+        double angleChange = b2 - b1;
+        if (angleChange > 180) angleChange -= 360;
+        if (angleChange < -180) angleChange += 360;
+
+        if (angleChange.abs() >= 45.0) {
+          final type = angleChange > 0 ? "right_bend" : "left_bend";
+          debugPrint('↩️ $type at ${dist.toStringAsFixed(1)}m (angle: ${angleChange.toStringAsFixed(1)}°)');
+          return {
+            "exists": true,
+            "type": type,
+            "distance": dist,
+            "intersectionLat": points[j - 1].latitude,
+            "intersectionLng": points[j - 1].longitude,
+          };
+        }
       }
     }
 
@@ -1384,7 +1386,7 @@ out body geom;""";
                       ),
                     ),
                   ),
-                // ─── Turn info card at bottom ───
+                // ─── Turn/junction info card at bottom ───
                 if (_turnInfo != null && _turnInfo!['exists'] == true)
                   Positioned(
                     bottom: 160,
@@ -1396,9 +1398,9 @@ out body geom;""";
                       child: Container(
                         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
                         decoration: BoxDecoration(
-                          color: _turnInfo!['type'] == 't_junction' || _turnInfo!['type'] == 'cross'
-                              ? Colors.orange.shade800
-                              : Colors.red.shade700,
+                          color: _turnInfo!['type'] == 'left_bend' || _turnInfo!['type'] == 'right_bend'
+                              ? Colors.red.shade700
+                              : Colors.orange.shade800,
                           borderRadius: BorderRadius.circular(12),
                           boxShadow: [
                             BoxShadow(
@@ -1411,9 +1413,11 @@ out body geom;""";
                         child: Row(
                           children: [
                             Icon(
-                              _turnInfo!['type'] == 'left' ? Icons.arrow_left :
-                              _turnInfo!['type'] == 'right' ? Icons.arrow_right :
-                              Icons.warning_amber_rounded,
+                              _turnInfo!['type'] == 'left_turn' || _turnInfo!['type'] == 'left_bend'
+                                  ? Icons.arrow_left
+                                  : _turnInfo!['type'] == 'right_turn' || _turnInfo!['type'] == 'right_bend'
+                                      ? Icons.arrow_right
+                                      : Icons.warning_amber_rounded,
                               color: Colors.white,
                               size: 28,
                             ),
@@ -1439,14 +1443,6 @@ out body geom;""";
                                         fontSize: 13,
                                       ),
                                     ),
-                                  if (_turnInfo!['availableTurns'] != null)
-                                    Text(
-                                      'Available: ${(_turnInfo!['availableTurns'] as List).join(", ")}',
-                                      style: TextStyle(
-                                        color: Colors.white.withOpacity(0.8),
-                                        fontSize: 12,
-                                      ),
-                                    ),
                                 ],
                               ),
                             ),
@@ -1463,10 +1459,12 @@ out body geom;""";
   String _buildTurnTitle() {
     final type = _turnInfo?['type'] as String?;
     switch (type) {
-      case 'left': return 'LEFT TURN';
-      case 'right': return 'RIGHT TURN';
+      case 'left_turn': return 'LEFT TURN';
+      case 'right_turn': return 'RIGHT TURN';
       case 't_junction': return 'T-JUNCTION';
       case 'cross': return 'CROSS INTERSECTION';
+      case 'left_bend': return 'ROAD BENDS LEFT';
+      case 'right_bend': return 'ROAD BENDS RIGHT';
       default: return 'JUNCTION AHEAD';
     }
   }
