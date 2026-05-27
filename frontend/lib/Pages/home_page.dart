@@ -31,10 +31,20 @@ class _HomePageState extends State<HomePage> {
   // Source selector: when moving use GPS course; when stationary use compass
   bool _usingGpsCourse = false;
   // User calibration offset, applied to heading (degrees, can be negative)
-  double _calibrationOffsetDeg = -42.0;
+  double _calibrationOffsetDeg = 0.0;
+
+  // Road matching (map-matching) state
+  bool _onRoad = false;
+  LatLng? _snappedPosition;
+  double? _roadHeadingDeg;
+  List<dynamic>? _cachedRoadData;
+  DateTime? _cachedRoadDataTime;
 
   // Threat markers rendered as red dots
   List<Marker> _threatMarkers = [];
+  // Active threats for banners
+  List<Map<String, dynamic>> _activeThreats = [];
+  Timer? _clearThreatTimer;
 
   StreamSubscription<Position>? _positionStream;
   StreamSubscription<CompassEvent>? _compassStream;
@@ -215,6 +225,7 @@ class _HomePageState extends State<HomePage> {
     _lastTimestamp = pos.timestamp ?? DateTime.now();
     _lastSpeed = pos.speed;
     _lastHeading = pos.heading;
+    _matchToRoad(pos.latitude, pos.longitude);
     _updateHeadingFromSources();
 
     // Skip fusion on web to prevent location drift
@@ -259,6 +270,96 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  LatLng _projectOnSegment(LatLng p, LatLng a, LatLng b) {
+    final double metersPerDegLat = 111320.0;
+    final double cosLat = cos(p.latitude * pi / 180.0);
+    final double metersPerDegLon = 111320.0 * (cosLat == 0 ? 1 : cosLat);
+
+    final double ax = a.longitude * metersPerDegLon;
+    final double ay = a.latitude * metersPerDegLat;
+    final double bx = b.longitude * metersPerDegLon;
+    final double by = b.latitude * metersPerDegLat;
+    final double px = p.longitude * metersPerDegLon;
+    final double py = p.latitude * metersPerDegLat;
+
+    final double abx = bx - ax;
+    final double aby = by - ay;
+    final double apx = px - ax;
+    final double apy = py - ay;
+
+    final double ab2 = abx * abx + aby * aby;
+    if (ab2 < 0.01) return a;
+
+    double t = (apx * abx + apy * aby) / ab2;
+    t = t.clamp(0.0, 1.0);
+
+    final double projX = ax + t * abx;
+    final double projY = ay + t * aby;
+
+    return LatLng(projY / metersPerDegLat, projX / metersPerDegLon);
+  }
+
+  void _matchToRoad(double lat, double lon) {
+    if (_cachedRoadData == null ||
+        _cachedRoadDataTime == null ||
+        DateTime.now().difference(_cachedRoadDataTime!).inSeconds > 5) {
+      _onRoad = false;
+      _snappedPosition = null;
+      _roadHeadingDeg = null;
+      return;
+    }
+
+    dynamic bestWay;
+    int bestSegmentIndex = 0;
+    double bestSegmentDist = double.infinity;
+
+    for (final el in _cachedRoadData!) {
+      if (el['geometry'] == null) continue;
+      final geom = el['geometry'] as List<dynamic>;
+      if (geom.length < 2) continue;
+
+      final points = geom
+          .map((p) => LatLng(p['lat'] as double, p['lon'] as double))
+          .toList();
+
+      for (int i = 0; i < points.length - 1; i++) {
+        final dist = _distanceToSegment(lat, lon, points[i], points[i + 1]);
+        if (dist < bestSegmentDist) {
+          bestSegmentDist = dist;
+          bestWay = el;
+          bestSegmentIndex = i;
+        }
+      }
+    }
+
+    if (bestWay == null || bestSegmentDist > 10) {
+      _onRoad = false;
+      _snappedPosition = null;
+      _roadHeadingDeg = null;
+      return;
+    }
+
+    final geom = bestWay['geometry'] as List<dynamic>;
+    final pt1 = LatLng(
+      geom[bestSegmentIndex]['lat'] as double,
+      geom[bestSegmentIndex]['lon'] as double,
+    );
+    final pt2 = LatLng(
+      geom[bestSegmentIndex + 1]['lat'] as double,
+      geom[bestSegmentIndex + 1]['lon'] as double,
+    );
+
+    _snappedPosition = _projectOnSegment(LatLng(lat, lon), pt1, pt2);
+
+    final segBearing = _bearing(pt1, pt2);
+    double headingDiff = (_lastHeading ?? segBearing) - segBearing;
+    if (headingDiff > 180) headingDiff -= 360;
+    if (headingDiff < -180) headingDiff += 360;
+    final goingForward = headingDiff.abs() <= 90;
+    _roadHeadingDeg = goingForward ? segBearing : (segBearing + 180) % 360;
+    _onRoad = true;
+  }
+
   void _initCompass() {
     _compassStream = FlutterCompass.events?.listen((event) {
       if (event.heading != null) {
@@ -279,6 +380,22 @@ class _HomePageState extends State<HomePage> {
       return n;
     }
 
+    final bool movingFast = (_lastSpeed ?? 0) > 2.5;
+
+    // 1) Road heading (from map matching) is most stable and correct
+    if (_onRoad && _roadHeadingDeg != null) {
+      _usingGpsCourse = false;
+      final double chosen = normalize(_roadHeadingDeg!);
+      const double alpha = 0.5;
+      double current = _displayHeadingDeg;
+      double delta = chosen - current;
+      if (delta > 180) delta -= 360;
+      if (delta < -180) delta += 360;
+      double next = current + alpha * delta;
+      _displayHeadingDeg = normalize(next);
+      return;
+    }
+
     double? gpsCourseDeg = (_lastHeading != null && _lastHeading! >= 0)
         ? normalize(_lastHeading!)
         : null;
@@ -286,7 +403,6 @@ class _HomePageState extends State<HomePage> {
     double? compassDeg = _hasCompassHeading ? normalize(_rotation) : null;
 
     // If moving > ~2.5 m/s (~9 km/h), prefer GPS course as it's usually more stable while driving
-    final bool movingFast = (_lastSpeed ?? 0) > 2.5;
     double? chosen;
     if (movingFast && gpsCourseDeg != null) {
       _usingGpsCourse = true;
@@ -305,7 +421,7 @@ class _HomePageState extends State<HomePage> {
     chosen = normalize(chosen + _calibrationOffsetDeg);
 
     // Smooth with exponential moving average to reduce jitter
-    const double alpha = 0.25; // higher = more responsive, lower = smoother
+    const double alpha = 0.5; // higher = more responsive, lower = smoother
     // Handle wrap-around (e.g., 359 to 1 should average across 0)
     double current = _displayHeadingDeg;
     double delta = chosen - current;
@@ -385,8 +501,6 @@ class _HomePageState extends State<HomePage> {
       _sendTimer?.cancel();
       _sendTimer = Timer.periodic(const Duration(seconds: 1), (_) async {
         _sendWebSocket();
-        // run a rate-limited turn check on the frontend (does not send to backend)
-        await _checkTurnAhead();
       });
 
       debugPrint('✅ WebSocket connected successfully');
@@ -411,23 +525,28 @@ class _HomePageState extends State<HomePage> {
     try {
       final String text = msg is String ? msg : msg.toString();
       final dynamic payload = jsonDecode(text);
+      if (payload is! Map) return;
 
-      // Expecting either { type: 'threats', positions: [ {id, lat, lng}, ... ] }
-      // or a direct { threats: [ {id, lat, lng}, ... ] }
-      final bool isThreatsType = payload is Map && payload['type'] == 'threats';
-      final List<dynamic> positions =
-          (payload is Map && payload['positions'] is List)
-          ? (payload['positions'] as List)
-          : (payload is Map && payload['threats'] is List)
+      // --- Format 1: Direct push from backend: {status: "threat", data: {...}} ---
+      if (payload['status'] == 'threat' && payload['data'] != null) {
+        final threat = payload['data'] as Map<String, dynamic>;
+        _showThreatAlert(threat);
+        return;
+      }
+
+      // --- Format 2: Heartbeat with threats: {status: "received", threats: [...]} ---
+      final List<dynamic> threats = payload['threats'] is List
           ? (payload['threats'] as List)
           : const [];
 
-      if (isThreatsType || positions.isNotEmpty) {
+      if (threats.isNotEmpty) {
         final List<Marker> markers = [];
-        for (final p in positions) {
-          if (p is! Map) continue;
-          final num? latNum = p['lat'] as num?;
-          final num? lngNum = p['lng'] as num?;
+        final List<Map<String, dynamic>> newThreats = [];
+
+        for (final t in threats) {
+          if (t is! Map) continue;
+          final num? latNum = t['lat'] as num?;
+          final num? lngNum = t['lng'] as num?;
           if (latNum == null || lngNum == null) continue;
 
           markers.add(
@@ -435,21 +554,84 @@ class _HomePageState extends State<HomePage> {
               point: LatLng(latNum.toDouble(), lngNum.toDouble()),
               width: 18,
               height: 18,
-              child: const Icon(Icons.circle, color: Colors.red, size: 12),
+              child: const Icon(Icons.warning, color: Colors.red, size: 14),
             ),
           );
+
+          newThreats.add(t.cast<String, dynamic>());
+          _showThreatAlert(t.cast<String, dynamic>());
         }
 
         if (mounted) {
           setState(() {
             _threatMarkers = markers;
+            _activeThreats = newThreats;
           });
         }
+
+        // Auto-clear threats after 10 seconds
+        _clearThreatTimer?.cancel();
+        _clearThreatTimer = Timer(const Duration(seconds: 10), () {
+          if (mounted) {
+            setState(() {
+              _threatMarkers = [];
+              _activeThreats = [];
+            });
+          }
+        });
       }
     } catch (e) {
       debugPrint('❌ Failed to parse WebSocket message: $e');
       debugPrint('Raw message: $msg');
     }
+  }
+
+  void _showThreatAlert(Map<String, dynamic> threat) {
+    if (!mounted) return;
+
+    final String type = threat['type'] ?? 'unknown';
+    final String message = threat['message'] ?? '⚠️ Collision risk detected';
+
+    IconData icon;
+    Color color;
+    switch (type) {
+      case 'turn_collision':
+        icon = Icons.turn_slight_right;
+        color = Colors.red;
+        break;
+      case 'predicted_collision':
+        icon = Icons.directions_car;
+        color = Colors.red;
+        break;
+      case 'rear_end':
+        icon = Icons.car_crash;
+        color = Colors.deepOrange;
+        break;
+      case 'wrong_direction':
+        icon = Icons.swap_horiz;
+        color = Colors.purple;
+        break;
+      default:
+        icon = Icons.warning;
+        color = Colors.orange;
+    }
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Row(
+          children: [
+            Icon(icon, color: Colors.white, size: 20),
+            const SizedBox(width: 10),
+            Expanded(child: Text(message, style: const TextStyle(fontSize: 14))),
+          ],
+        ),
+        backgroundColor: color,
+        duration: const Duration(seconds: 5),
+        behavior: SnackBarBehavior.floating,
+        margin: const EdgeInsets.only(bottom: 100, left: 10, right: 10),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+      ),
+    );
   }
 
   void _sendWebSocket() {
@@ -533,6 +715,7 @@ class _HomePageState extends State<HomePage> {
     _magStream?.cancel();
     _connectivityStream?.cancel();
     _sendTimer?.cancel();
+    _clearThreatTimer?.cancel();
     _ws?.sink.close();
     super.dispose();
   }
@@ -567,7 +750,7 @@ class _HomePageState extends State<HomePage> {
     return (atan2(y, x) * 180 / pi + 360) % 360;
   }
 
-  // Rate-limited check: only run overpass if position changed by >= 1m or >2s since last check
+  // Rate-limited check: only query roads if position changed significantly
   Future<void> _maybeScheduleTurnCheck() async {
     try {
       final now = DateTime.now();
@@ -582,7 +765,7 @@ class _HomePageState extends State<HomePage> {
                 _lastTurnCheckPosition!.latitude,
                 _lastTurnCheckPosition!.longitude,
               );
-        if (dt < 1500 && moved < 1.0) {
+        if (dt < 15000 && moved < 5.0) {
           // too soon and not moved enough
           return;
         }
@@ -599,42 +782,29 @@ class _HomePageState extends State<HomePage> {
     final lat = _fusedPosition!.latitude;
     final lon = _fusedPosition!.longitude;
 
-    // Overpass query: get all nearby highway ways excluding steps, with geometry
-    // Includes: motorways, primary, secondary, tertiary, residential, service,
-    // cycleways, tracks, etc.
-    final query =
-        """[out:json];
-way["highway"]["highway"!="steps"](around:60,$lat,$lon);
-out body geom;""";
-
-    // Try multiple Overpass servers for reliability
-    final List<String> overpassServers = [
-      "https://overpass-api.de/api/interpreter",
-      "https://overpass.kumi.systems/api/interpreter",
-      "https://overpass.openstreetmap.ru/api/interpreter",
-    ];
-
     Map<String, dynamic>? data;
-    for (final server in overpassServers) {
-      try {
-        final url = Uri.parse("$server?data=${Uri.encodeComponent(query)}");
-        final res = await http.get(url).timeout(const Duration(seconds: 10));
+    try {
+      final url = Uri.parse(
+        "https://safety-backend-m5n6.onrender.com/api/nearby-roads"
+        "?lat=$lat&lon=$lon&radius=60",
+      );
+      final res = await http.get(url).timeout(const Duration(seconds: 5));
 
-        if (res.statusCode == 200) {
-          data = jsonDecode(res.body);
-          if (data?['elements'] != null && data!['elements'].isNotEmpty) {
-            debugPrint('✅ Overpass query succeeded from $server');
-            break;
-          }
-        }
-      } catch (e) {
-        debugPrint('⚠️ Overpass server $server failed: $e');
-        continue;
+      if (res.statusCode == 200) {
+        data = jsonDecode(res.body);
+        debugPrint('✅ Nearby roads query succeeded');
       }
+    } catch (e) {
+      debugPrint('⚠️ Nearby roads query failed: $e');
+    }
+
+    if (data != null && data['elements'] != null) {
+      _cachedRoadData = data['elements'];
+      _cachedRoadDataTime = DateTime.now();
     }
 
     if (data == null || data['elements'] == null || data['elements'].isEmpty) {
-      debugPrint('⚠️ No OSM ways found nearby');
+      debugPrint('⚠️ No roads found nearby');
       return null;
     }
 
@@ -1086,7 +1256,7 @@ out body geom;""";
                                 ),
                                 const SizedBox(width: 4),
                                 Text(
-                                  '${_displayHeadingDeg.toStringAsFixed(0)}° ${_usingGpsCourse ? 'gps' : (_hasCompassHeading ? 'compass' : 'n/a')} (+42°)',
+                                  '${_displayHeadingDeg.toStringAsFixed(0)}° ${_onRoad ? 'road' : (_usingGpsCourse ? 'gps' : (_hasCompassHeading ? 'compass' : 'n/a'))} (cal: ${_calibrationOffsetDeg.toStringAsFixed(0)}°)',
                                   style: const TextStyle(
                                     color: Colors.white,
                                     fontSize: 12,
@@ -1101,9 +1271,66 @@ out body geom;""";
                     ),
                   ),
                 ),
+                // Active threat banners (above map)
+                if (_activeThreats.isNotEmpty)
+                  Positioned(
+                    top: 76,
+                    left: 8,
+                    right: 8,
+                    child: Column(
+                      children: _activeThreats.map((t) {
+                        final type = t['type'] ?? 'unknown';
+                        final msg = t['message'] ?? 'Collision risk';
+                        Color bgColor;
+                        IconData icon;
+                        switch (type) {
+                          case 'turn_collision':
+                            bgColor = Colors.red.shade700;
+                            icon = Icons.turn_slight_right;
+                            break;
+                          case 'predicted_collision':
+                            bgColor = Colors.red.shade700;
+                            icon = Icons.directions_car;
+                            break;
+                          case 'rear_end':
+                            bgColor = Colors.deepOrange;
+                            icon = Icons.car_crash;
+                            break;
+                          case 'wrong_direction':
+                            bgColor = Colors.purple;
+                            icon = Icons.swap_horiz;
+                            break;
+                          default:
+                            bgColor = Colors.orange.shade800;
+                            icon = Icons.warning;
+                        }
+                        return Container(
+                          margin: const EdgeInsets.only(bottom: 4),
+                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                          decoration: BoxDecoration(
+                            color: bgColor,
+                            borderRadius: BorderRadius.circular(10),
+                            boxShadow: [BoxShadow(color: Colors.black38, blurRadius: 6)],
+                          ),
+                          child: Row(
+                            children: [
+                              Icon(icon, color: Colors.white, size: 18),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: Text(
+                                  msg,
+                                  style: const TextStyle(color: Colors.white, fontSize: 13),
+                                ),
+                              ),
+                            ],
+                          ),
+                        );
+                      }).toList(),
+                    ),
+                  ),
                 // Map with top padding for status bar
                 Positioned(
-                  top: 80, // Space for status bar
+                  top: _activeThreats.isNotEmpty ? 140 : 80,
                   left: 0,
                   right: 0,
                   bottom: 0,
@@ -1129,7 +1356,7 @@ out body geom;""";
                       MarkerLayer(
                         markers: [
                           Marker(
-                            point: _currentPosition!,
+                            point: _snappedPosition ?? _currentPosition!,
                             width: 60,
                             height: 60,
                             rotate: false,
@@ -1137,9 +1364,9 @@ out body geom;""";
                               turns: ((_displayHeadingDeg % 360) / 360),
                               duration: const Duration(milliseconds: 150),
                               curve: Curves.easeOut,
-                              child: const Icon(
+                              child: Icon(
                                 Icons.navigation,
-                                color: Colors.blue,
+                                color: _onRoad ? Colors.green : Colors.blue,
                                 size: 45,
                               ),
                             ),
