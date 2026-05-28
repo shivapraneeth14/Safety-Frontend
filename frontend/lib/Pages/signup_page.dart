@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
+import '../Config/app_config.dart';
 
 class SignupPage extends StatefulWidget {
   const SignupPage({super.key});
@@ -19,7 +20,7 @@ class _SignupPageState extends State<SignupPage> {
     setState(() => loading = true);
 
     final response = await http.post(
-      Uri.parse("https://safety-backend-m5n6.onrender.com/api/register"),
+      Uri.parse("${AppConfig.baseUrl}/api/register"),
       headers: {"Content-Type": "application/json"},
       body: jsonEncode({
         "username": username,

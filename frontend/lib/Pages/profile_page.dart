@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
+import '../Config/app_config.dart';
 import 'login_page.dart'; // Make sure this import is correct
 
 class ProfilePage extends StatefulWidget {
@@ -39,7 +40,7 @@ class _ProfilePageState extends State<ProfilePage> {
     }
 
     final url = Uri.parse(
-      "https://safety-backend-m5n6.onrender.com/api/current",
+      "${AppConfig.baseUrl}/api/current",
     );
 
     try {
@@ -93,7 +94,7 @@ class _ProfilePageState extends State<ProfilePage> {
     if (token != null) {
       try {
         final url = Uri.parse(
-          "https://safety-backend-m5n6.onrender.com/api/logout",
+          "${AppConfig.baseUrl}/api/logout",
         );
         final response = await http.post(
           url,

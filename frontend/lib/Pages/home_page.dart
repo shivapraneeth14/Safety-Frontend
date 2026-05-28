@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:geolocator/geolocator.dart';
@@ -11,6 +12,7 @@ import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
+import '../Config/app_config.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -63,7 +65,6 @@ class _HomePageState extends State<HomePage> {
   GyroscopeEvent? _lastGyro;
   MagnetometerEvent? _lastMag;
 
-  final String backendWsUrl = "wss://safety-backend-m5n6.onrender.com";
   WebSocketChannel? _ws;
   Timer? _sendTimer;
 
@@ -85,6 +86,10 @@ class _HomePageState extends State<HomePage> {
   _turnInfo; // { exists, type, distance, intersectionLat, intersectionLng }
   DateTime? _lastTurnCheckTime;
   LatLng? _lastTurnCheckPosition;
+
+  // Upcoming turns from backend cone query
+  List<Map<String, dynamic>> _upcomingTurns = [];
+  Map<String, dynamic>? _currentRoadInfo;
 
   @override
   void initState() {
@@ -117,7 +122,7 @@ class _HomePageState extends State<HomePage> {
     }
 
     final url = Uri.parse(
-      "https://safety-backend-m5n6.onrender.com/api/current",
+      "${AppConfig.baseUrl}/api/current",
     );
 
     try {
@@ -199,8 +204,8 @@ class _HomePageState extends State<HomePage> {
   void _updatePosition(Position pos, {bool initial = false}) {
     _currentPosition = LatLng(pos.latitude, pos.longitude);
 
-    // For web, use GPS directly without fusion to avoid drift
-    _fusedPosition = _currentPosition;
+    // Set raw GPS as initial fused position; sensor fusion may modify it below
+    _fusedPosition = LatLng(pos.latitude, pos.longitude);
 
     // Only auto-center the map during initial location fetch or if user hasn't interacted yet
     try {
@@ -228,8 +233,11 @@ class _HomePageState extends State<HomePage> {
     _matchToRoad(pos.latitude, pos.longitude);
     _updateHeadingFromSources();
 
-    // Skip fusion on web to prevent location drift
-    // _applyFusion(pos);
+    // FIX BUG #12: Sensor fusion enabled for Android/iOS
+    // Uses gyroscope + accelerometer + heading to augment GPS
+    if (_lastGyro != null) {
+      _applyFusion(pos);
+    }
 
     // Trigger a turn-check when position changes significantly (rate-limited)
     _maybeScheduleTurnCheck();
@@ -237,37 +245,55 @@ class _HomePageState extends State<HomePage> {
     setState(() {});
   }
 
+  // FIX BUG #12: Sensor fusion with gyroscope heading correction
   void _applyFusion(Position gps) {
     final now = gps.timestamp ?? DateTime.now();
     if (_fusedPosition == null) {
       _fusedPosition = LatLng(gps.latitude, gps.longitude);
+      _lastTimestamp = now;
       return;
     }
 
     double dt = _lastTimestamp != null
         ? (now.difference(_lastTimestamp!).inMilliseconds / 1000.0)
         : 0.0;
+    _lastTimestamp = now;
 
-    if (_lastSpeed != null && _lastHeading != null && dt > 0) {
-      double headingRad = _lastHeading! * pi / 180.0;
-      double dx = _lastSpeed! * dt * sin(headingRad);
-      double dy = _lastSpeed! * dt * cos(headingRad);
-      const metersPerDegLat = 111320.0;
-      final metersPerDegLon =
-          metersPerDegLat * cos(_fusedPosition!.latitude * pi / 180.0);
-      final dLat = dy / metersPerDegLat;
-      final dLon = dx / (metersPerDegLon == 0 ? 1 : metersPerDegLon);
-      LatLng deadReckon = LatLng(
-        _fusedPosition!.latitude + dLat,
-        _fusedPosition!.longitude + dLon,
-      );
-      const alpha = 0.85;
-      double fusedLat =
-          alpha * gps.latitude + (1 - alpha) * deadReckon.latitude;
-      double fusedLon =
-          alpha * gps.longitude + (1 - alpha) * deadReckon.longitude;
-      _fusedPosition = LatLng(fusedLat, fusedLon);
+    if (dt > 0.05 && dt < 5.0) { // Sanity check time delta
+      // Use gyroscope to adjust heading if available
+      double effectiveHeading = _lastHeading ?? 0;
+      if (_lastGyro != null && _lastGyro!.z.abs() > 0.1) {
+        // Gyro gives rad/s, convert to degrees
+        final gyroDeg = _lastGyro!.z * (180 / pi) * dt;
+        effectiveHeading = (effectiveHeading + gyroDeg) % 360;
+        if (effectiveHeading < 0) effectiveHeading += 360;
+      }
+
+      if (_lastSpeed != null && _lastSpeed! > 0.5 && effectiveHeading >= 0) {
+        double headingRad = effectiveHeading * pi / 180.0;
+        double dx = _lastSpeed! * dt * sin(headingRad);
+        double dy = _lastSpeed! * dt * cos(headingRad);
+        const metersPerDegLat = 111320.0;
+        final metersPerDegLon =
+            metersPerDegLat * cos(_fusedPosition!.latitude * pi / 180.0);
+        final dLat = dy / metersPerDegLat;
+        final dLon = dx / (metersPerDegLon == 0 ? 1 : metersPerDegLon);
+        LatLng deadReckon = LatLng(
+          _fusedPosition!.latitude + dLat,
+          _fusedPosition!.longitude + dLon,
+        );
+        // Complementary filter: trust GPS more at high speeds, dead reckoning more at low speeds
+        final alpha = _lastSpeed! > 5 ? 0.9 : 0.7;
+        double fusedLat =
+            alpha * gps.latitude + (1 - alpha) * deadReckon.latitude;
+        double fusedLon =
+            alpha * gps.longitude + (1 - alpha) * deadReckon.longitude;
+        _fusedPosition = LatLng(fusedLat, fusedLon);
+        return;
+      }
     }
+    // Fallback to raw GPS
+    _fusedPosition = LatLng(gps.latitude, gps.longitude);
   }
 
   LatLng _projectOnSegment(LatLng p, LatLng a, LatLng b) {
@@ -452,61 +478,88 @@ class _HomePageState extends State<HomePage> {
         : ConnectivityResult.none;
   }
 
+  // Offline message queue
+  // FIX BUG #28: Buffer unsent messages during disconnect, flush on reconnect
+  final List<Map<String, dynamic>> _pendingMessages = [];
+  static const int _maxPendingMessages = 30;
+
   // ======================
   // WebSocket + Data Sender
   // ======================
   void _initWebSocket() {
-    if (backendWsUrl.trim().isEmpty) {
-      debugPrint('❌ WebSocket URL is empty');
-      return;
-    }
     _connectWebSocket();
+  }
+
+  Future<String> _getWsUrlWithToken() async {
+    final prefs = await SharedPreferences.getInstance();
+    final token = prefs.getString('accessToken') ?? '';
+    return '${AppConfig.wsUrl}?token=$token';
   }
 
   void _connectWebSocket() {
     try {
       _ws?.sink.close(); // Close existing connection if any
-      _ws = WebSocketChannel.connect(Uri.parse(backendWsUrl));
-      debugPrint('🔗 Connecting to WebSocket: $backendWsUrl');
+      // FIX BUG #2: Pass JWT token as query parameter for WebSocket auth
+      final wsUrlFuture = _getWsUrlWithToken();
+      wsUrlFuture.then((wsUrl) {
+        _ws = WebSocketChannel.connect(Uri.parse(wsUrl));
+        debugPrint('🔗 Connecting to WebSocket with auth');
 
-      _ws!.stream.listen(
-        (msg) {
-          debugPrint('📥 WS Message: $msg');
-          _handleWsMessage(msg);
-          setState(() {
-            _isConnected = true;
-            _connectionStatus = 'Connected';
-          });
-        },
+        _ws!.stream.listen(
+          (msg) {
+            debugPrint('📥 WS Message: $msg');
+            _handleWsMessage(msg);
+            setState(() {
+              _isConnected = true;
+              _connectionStatus = 'Connected';
+            });
+            // Flush pending messages on reconnect
+            // FIX BUG #28: Send queued messages
+            if (_pendingMessages.isNotEmpty) {
+              debugPrint('📤 Flushing ${_pendingMessages.length} pending messages');
+              for (final pm in _pendingMessages) {
+                try {
+                  _ws!.sink.add(jsonEncode(pm));
+                } catch (e) {
+                  debugPrint('❌ Failed to flush pending message: $e');
+                }
+              }
+              _pendingMessages.clear();
+            }
+          },
 
-        onDone: () {
-          debugPrint('ℹ️ WebSocket closed - attempting to reconnect...');
-          setState(() {
-            _isConnected = false;
-            _connectionStatus = 'Reconnecting...';
-          });
-          _reconnectWebSocket();
-        },
-        onError: (e) {
-          debugPrint('❌ WebSocket error: $e - attempting to reconnect...');
-          setState(() {
-            _isConnected = false;
-            _connectionStatus = 'Connection Error';
-          });
-          _reconnectWebSocket();
-        },
-      );
+          onDone: () {
+            debugPrint('ℹ️ WebSocket closed - attempting to reconnect...');
+            setState(() {
+              _isConnected = false;
+              _connectionStatus = 'Reconnecting...';
+            });
+            _reconnectWebSocket();
+          },
+          onError: (e) {
+            debugPrint('❌ WebSocket error: $e - attempting to reconnect...');
+            setState(() {
+              _isConnected = false;
+              _connectionStatus = 'Connection Error';
+            });
+            _reconnectWebSocket();
+          },
+        );
 
-      // Start sending data every second
-      _sendTimer?.cancel();
-      _sendTimer = Timer.periodic(const Duration(seconds: 1), (_) async {
-        _sendWebSocket();
-      });
+        // Start sending data every second
+        _sendTimer?.cancel();
+        _sendTimer = Timer.periodic(const Duration(seconds: 1), (_) async {
+          _sendWebSocket();
+        });
 
-      debugPrint('✅ WebSocket connected successfully');
-      setState(() {
-        _isConnected = true;
-        _connectionStatus = 'Connected';
+        debugPrint('✅ WebSocket connected successfully');
+        setState(() {
+          _isConnected = true;
+          _connectionStatus = 'Connected';
+        });
+      }).catchError((e) {
+        debugPrint('❌ WebSocket connection failed: $e - will retry...');
+        _reconnectWebSocket();
       });
     } catch (e) {
       debugPrint('❌ WebSocket connection failed: $e - will retry...');
@@ -580,17 +633,40 @@ class _HomePageState extends State<HomePage> {
           }
         });
       }
+
+      // Extract upcoming turns from backend response
+      if (payload['upcomingTurns'] is List) {
+        final turns = (payload['upcomingTurns'] as List)
+            .whereType<Map<String, dynamic>>()
+            .toList();
+        if (mounted) {
+          setState(() {
+            _upcomingTurns = turns;
+          });
+        }
+      }
+
+      // Extract current road info
+      if (payload['currentRoadInfo'] is Map) {
+        if (mounted) {
+          setState(() {
+            _currentRoadInfo = payload['currentRoadInfo'] as Map<String, dynamic>?;
+          });
+        }
+      }
     } catch (e) {
       debugPrint('❌ Failed to parse WebSocket message: $e');
       debugPrint('Raw message: $msg');
     }
   }
 
+  // FIX BUG #24: Add vibration + sound on alert
   void _showThreatAlert(Map<String, dynamic> threat) {
     if (!mounted) return;
 
     final String type = threat['type'] ?? 'unknown';
     final String message = threat['message'] ?? '⚠️ Collision risk detected';
+    final int severity = threat['severity'] ?? 1;
 
     IconData icon;
     Color color;
@@ -616,13 +692,35 @@ class _HomePageState extends State<HomePage> {
         color = Colors.orange;
     }
 
+    // Trigger vibration (SOS pattern for severity 3)
+    HapticFeedback.heavyImpact();
+    if (severity >= 2) {
+      HapticFeedback.heavyImpact();
+      Future.delayed(const Duration(milliseconds: 200), () {
+        HapticFeedback.heavyImpact();
+      });
+    }
+
+    // Play system alert sound
+    SystemSound.play(SystemSoundType.alert);
+
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Row(
           children: [
             Icon(icon, color: Colors.white, size: 20),
             const SizedBox(width: 10),
-            Expanded(child: Text(message, style: const TextStyle(fontSize: 14))),
+            Expanded(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(message, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
+                  if (severity > 0)
+                    Text('Severity: $severity/3', style: const TextStyle(fontSize: 12)),
+                ],
+              ),
+            ),
           ],
         ),
         backgroundColor: color,
@@ -681,6 +779,20 @@ class _HomePageState extends State<HomePage> {
     debugPrint("📤 Sending WebSocket data...");
     debugPrint(jsonEncode(payload));
 
+    // FIX BUG #28: Offline buffer — queue if not connected
+    if (!_isConnected || _ws == null) {
+      if (_pendingMessages.length < _maxPendingMessages) {
+        _pendingMessages.add(payload as Map<String, dynamic>);
+        debugPrint("📤 Queued for later (${_pendingMessages.length} pending)");
+      } else {
+        debugPrint("⚠️ Pending message queue full, dropping oldest");
+        _pendingMessages.removeAt(0);
+        _pendingMessages.add(payload as Map<String, dynamic>);
+      }
+      setState(() => _isSendingData = false);
+      return;
+    }
+
     try {
       setState(() {
         _isSendingData = true;
@@ -688,7 +800,7 @@ class _HomePageState extends State<HomePage> {
 
       _ws!.sink.add(jsonEncode(payload));
       _lastDataSent = DateTime.now();
-      _lastSentData = payload; // Store the data for viewing
+      _lastSentData = payload;
 
       setState(() {
         _isSendingData = false;
@@ -696,12 +808,16 @@ class _HomePageState extends State<HomePage> {
 
       debugPrint("✅ Data sent successfully at ${DateTime.now()}");
     } catch (e) {
+      // Queue on send failure too
+      if (_pendingMessages.length < _maxPendingMessages) {
+        _pendingMessages.add(payload as Map<String, dynamic>);
+      }
       setState(() {
         _isSendingData = false;
         _isConnected = false;
         _connectionStatus = 'Send Error';
       });
-      debugPrint("❌ Failed to send data: $e - attempting to reconnect...");
+      debugPrint("❌ Failed to send data: $e - queued for retry");
       _reconnectWebSocket();
     }
   }
@@ -750,11 +866,28 @@ class _HomePageState extends State<HomePage> {
     return (atan2(y, x) * 180 / pi + 360) % 360;
   }
 
-  // Rate-limited check: only query roads if position changed significantly
+  // Speed-aware rate-limited check: OR condition (time OR distance)
   Future<void> _maybeScheduleTurnCheck() async {
     try {
       final now = DateTime.now();
       if (_fusedPosition == null) return;
+
+      // Faster speed = more frequent checks
+      final speed = _lastSpeed ?? 0;
+      int minSeconds;
+      if (speed > 13.9) {        // > 50 km/h
+        minSeconds = 3;
+      } else if (speed > 8.3) {  // > 30 km/h
+        minSeconds = 5;
+      } else if (speed > 4.2) {  // > 15 km/h
+        minSeconds = 8;
+      } else {
+        minSeconds = 15;
+      }
+
+      // Check every 25m moved (half of minimum scan range)
+      const double minDistance = 25.0;
+
       if (_lastTurnCheckTime != null) {
         final dt = now.difference(_lastTurnCheckTime!).inMilliseconds;
         final moved = _lastTurnCheckPosition == null
@@ -765,28 +898,53 @@ class _HomePageState extends State<HomePage> {
                 _lastTurnCheckPosition!.latitude,
                 _lastTurnCheckPosition!.longitude,
               );
-        if (dt < 15000 && moved < 5.0) {
-          // too soon and not moved enough
+
+        // OR condition — check if EITHER enough time passed OR enough distance moved
+        if (dt < minSeconds * 1000 && moved < minDistance) {
           return;
         }
       }
+
       await _checkTurnAhead();
     } catch (e) {
       debugPrint('❌ Turn check failed: $e');
     }
   }
 
+  double _getScanRadius() {
+    final speed = _lastSpeed ?? 0;
+    if (speed > 13.9) return 150;   // > 50 km/h
+    if (speed > 8.3)  return 100;   // > 30 km/h
+    return 60;                      // slow speed
+  }
+
+  // Cache position for road data fetch-distance check
+  LatLng? _lastRoadFetchPosition;
+
   Future<Map<String, dynamic>?> _detectTurnAhead() async {
     if (_fusedPosition == null) return null;
 
     final lat = _fusedPosition!.latitude;
     final lon = _fusedPosition!.longitude;
+    final scanRadius = _getScanRadius();
+
+    // FIX BUG #36: Use cached road data if within 20m of last fetch
+    if (_cachedRoadData != null && _lastRoadFetchPosition != null && _cachedRoadData!.isNotEmpty) {
+      final distSinceFetch = _distance(
+        lat, lon,
+        _lastRoadFetchPosition!.latitude, _lastRoadFetchPosition!.longitude,
+      );
+      if (distSinceFetch < 20.0) {
+        debugPrint('🗺️ Using cached road data (moved ${distSinceFetch.toStringAsFixed(1)}m)');
+        return _processTurnDataFromElements(_cachedRoadData!, lat, lon, scanRadius);
+      }
+    }
 
     Map<String, dynamic>? data;
     try {
       final url = Uri.parse(
-        "https://safety-backend-m5n6.onrender.com/api/nearby-roads"
-        "?lat=$lat&lon=$lon&radius=60",
+        "${AppConfig.baseUrl}/api/nearby-roads"
+        "?lat=$lat&lon=$lon&radius=$scanRadius",
       );
       final res = await http.get(url).timeout(const Duration(seconds: 5));
 
@@ -796,24 +954,36 @@ class _HomePageState extends State<HomePage> {
       }
     } catch (e) {
       debugPrint('⚠️ Nearby roads query failed: $e');
-    }
-
-    if (data != null && data['elements'] != null) {
-      _cachedRoadData = data['elements'];
-      _cachedRoadDataTime = DateTime.now();
-    }
-
-    if (data == null || data['elements'] == null || data['elements'].isEmpty) {
-      debugPrint('⚠️ No roads found nearby');
+      if (_cachedRoadData != null && _cachedRoadData!.isNotEmpty) {
+        debugPrint('🗺️ Falling back to cached road data');
+        return _processTurnDataFromElements(_cachedRoadData!, lat, lon, scanRadius);
+      }
       return null;
     }
+
+    if (data != null && data['elements'] != null && (data['elements'] as List).isNotEmpty) {
+      _cachedRoadData = List.from(data['elements']);
+      _cachedRoadDataTime = DateTime.now();
+      _lastRoadFetchPosition = _fusedPosition;
+      return _processTurnDataFromElements(_cachedRoadData!, lat, lon, scanRadius);
+    }
+
+    debugPrint('⚠️ No roads found nearby');
+    if (_cachedRoadData != null && _cachedRoadData!.isNotEmpty) {
+      debugPrint('🗺️ Falling back to cached road data');
+      return _processTurnDataFromElements(_cachedRoadData!, lat, lon, scanRadius);
+    }
+    return null;
+  }
+
+  Future<Map<String, dynamic>?> _processTurnDataFromElements(List<dynamic> elements, double lat, double lon, double scanRadius) async {
 
     // Find the way with the closest segment to the user's position
     dynamic bestWay;
     int bestSegmentIndex = 0;
     double bestSegmentDist = double.infinity;
 
-    for (final el in data['elements']) {
+    for (final el in elements) {
       if (el['geometry'] == null) continue;
       final geom = el['geometry'] as List<dynamic>;
       if (geom.length < 2) continue;
@@ -869,7 +1039,7 @@ class _HomePageState extends State<HomePage> {
       // Build node-to-ways index
       final Map<int, List<int>> nodeToWays = {};
       final bestWayId = bestWay['id'] as int;
-      for (final el in data['elements']) {
+      for (final el in elements) {
         if (el['type'] != 'way' || el['nodes'] == null) continue;
         final wId = el['id'] as int;
         for (final nid in (el['nodes'] as List).cast<int>()) {
@@ -879,7 +1049,7 @@ class _HomePageState extends State<HomePage> {
 
       // Index other way geometries for direction lookup
       final Map<int, List> otherGeoms = {};
-      for (final el in data['elements']) {
+      for (final el in elements) {
         if (el['type'] == 'way' && el['id'] != bestWayId && el['geometry'] != null) {
           otherGeoms[el['id'] as int] = el['geometry'] as List;
         }
@@ -892,7 +1062,7 @@ class _HomePageState extends State<HomePage> {
 
       for (int j = startIndex; goingForward ? j < scanLimit : j >= scanLimit; j += scanStep) {
         final dist = _distance(lat, lon, points[j].latitude, points[j].longitude);
-        if (dist > 50) break;
+        if (dist > scanRadius) break;
 
         final nodeId = nodes[j] as int;
         final waysHere = nodeToWays[nodeId] ?? [];
@@ -980,7 +1150,7 @@ class _HomePageState extends State<HomePage> {
     if (goingForward) {
       for (int j = startIndex; j + 2 < points.length; j++) {
         final dist = _distance(lat, lon, points[j + 1].latitude, points[j + 1].longitude);
-        if (dist > 50) break;
+        if (dist > scanRadius) break;
 
         final b1 = _bearing(points[j], points[j + 1]);
         final b2 = _bearing(points[j + 1], points[j + 2]);
@@ -1003,7 +1173,7 @@ class _HomePageState extends State<HomePage> {
     } else {
       for (int j = startIndex; j >= 2; j--) {
         final dist = _distance(lat, lon, points[j - 1].latitude, points[j - 1].longitude);
-        if (dist > 50) break;
+        if (dist > scanRadius) break;
 
         final b1 = _bearing(points[j], points[j - 1]);
         final b2 = _bearing(points[j - 1], points[j - 2]);
@@ -1640,11 +1810,7 @@ class _HomePageState extends State<HomePage> {
                         child: Row(
                           children: [
                             Icon(
-                              _turnInfo!['type'] == 'left_turn' || _turnInfo!['type'] == 'left_bend'
-                                  ? Icons.arrow_left
-                                  : _turnInfo!['type'] == 'right_turn' || _turnInfo!['type'] == 'right_bend'
-                                      ? Icons.arrow_right
-                                      : Icons.warning_amber_rounded,
+                              _buildTurnIcon(_turnInfo!['type']),
                               color: Colors.white,
                               size: 28,
                             ),
@@ -1678,6 +1844,112 @@ class _HomePageState extends State<HomePage> {
                       ),
                     ),
                   ),
+                // ─── Upcoming turns list (from backend cone query) ───
+                if (_upcomingTurns.isNotEmpty)
+                  Positioned(
+                    bottom: 250,
+                    left: 16,
+                    right: 16,
+                    child: Container(
+                      constraints: const BoxConstraints(maxHeight: 160),
+                      padding: const EdgeInsets.all(10),
+                      decoration: BoxDecoration(
+                        color: Colors.black87,
+                        borderRadius: BorderRadius.circular(12),
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.black.withOpacity(0.5),
+                            blurRadius: 8,
+                            offset: const Offset(0, 4),
+                          ),
+                        ],
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Text(
+                            'TURNS AHEAD',
+                            style: TextStyle(
+                              color: Colors.white70,
+                              fontSize: 11,
+                              fontWeight: FontWeight.bold,
+                              letterSpacing: 1,
+                            ),
+                          ),
+                          const SizedBox(height: 6),
+                          Flexible(
+                            child: ListView.builder(
+                              shrinkWrap: true,
+                              itemCount: _upcomingTurns.length,
+                              itemBuilder: (context, index) {
+                                final turn = _upcomingTurns[index];
+                                final type = turn['type'] as String? ?? 'unknown';
+                                final distance = turn['distance'] as int? ?? 0;
+                                final timeToReach = turn['timeToReach'] as num? ?? 0;
+                                final riskLevel = turn['riskLevel'] as int? ?? 1;
+                                final isBlind = turn['blind'] as bool? ?? false;
+                                final vehiclesNearby = turn['vehiclesNearby'] as bool? ?? false;
+                                final angle = turn['angle'] as int? ?? 0;
+
+                                // Color code by risk
+                                Color dotColor;
+                                if (vehiclesNearby && isBlind) {
+                                  dotColor = Colors.red;
+                                } else if (isBlind) {
+                                  dotColor = Colors.orange;
+                                } else {
+                                  dotColor = Colors.green;
+                                }
+
+                                IconData turnIcon = _buildTurnIcon(type);
+
+                                return Padding(
+                                  padding: const EdgeInsets.symmetric(vertical: 2),
+                                  child: Row(
+                                    children: [
+                                      Icon(turnIcon, color: dotColor, size: 16),
+                                      const SizedBox(width: 8),
+                                      Expanded(
+                                        child: Text(
+                                          _formatTurnType(type),
+                                          style: TextStyle(
+                                            color: dotColor,
+                                            fontSize: 13,
+                                            fontWeight: FontWeight.w600,
+                                          ),
+                                        ),
+                                      ),
+                                      Text(
+                                        '${distance}m',
+                                        style: const TextStyle(
+                                          color: Colors.white70,
+                                          fontSize: 12,
+                                        ),
+                                      ),
+                                      const SizedBox(width: 8),
+                                      Text(
+                                        '${timeToReach}s',
+                                        style: const TextStyle(
+                                          color: Colors.white54,
+                                          fontSize: 11,
+                                        ),
+                                      ),
+                                      if (riskLevel >= 3)
+                                        const Padding(
+                                          padding: EdgeInsets.only(left: 4),
+                                          child: Icon(Icons.warning, color: Colors.red, size: 14),
+                                        ),
+                                    ],
+                                  ),
+                                );
+                              },
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
               ],
             ),
     );
@@ -1686,13 +1958,91 @@ class _HomePageState extends State<HomePage> {
   String _buildTurnTitle() {
     final type = _turnInfo?['type'] as String?;
     switch (type) {
-      case 'left_turn': return 'LEFT TURN';
-      case 'right_turn': return 'RIGHT TURN';
+      case 'left_turn': case 'left': return 'LEFT TURN';
+      case 'right_turn': case 'right': return 'RIGHT TURN';
+      case 'slight_left': case 'gentle_curve_left': return 'GENTLE LEFT';
+      case 'slight_right': case 'gentle_curve_right': return 'GENTLE RIGHT';
+      case 'sharp_left': return 'SHARP LEFT';
+      case 'sharp_right': return 'SHARP RIGHT';
+      case 'hairpin_left': return 'HAIRPIN LEFT';
+      case 'hairpin_right': return 'HAIRPIN RIGHT';
       case 't_junction': return 'T-JUNCTION';
+      case 'y_junction': return 'Y-JUNCTION';
       case 'cross': return 'CROSS INTERSECTION';
+      case 'offset_junction': return 'OFFSET JUNCTION';
+      case 'roundabout': return 'ROUNDABOUT';
+      case 'mini_roundabout': return 'MINI ROUNDABOUT';
+      case 'slip_road': return 'SLIP ROAD';
       case 'left_bend': return 'ROAD BENDS LEFT';
       case 'right_bend': return 'ROAD BENDS RIGHT';
+      case 's_curve': return 'S-CURVE';
+      case 'reverse_s_curve': return 'REVERSE S-CURVE';
+      case 'blind_crest': return 'BLIND CREST';
+      case 'dip': return 'DIP AHEAD';
+      case 'narrow_section': return 'NARROW ROAD';
+      case 'dead_end': return 'DEAD END';
+      case 'complex': return 'COMPLEX JUNCTION';
       default: return 'JUNCTION AHEAD';
+    }
+  }
+
+  IconData _buildTurnIcon(dynamic type) {
+    final String? t = type?.toString();
+    switch (t) {
+      case 'left_turn': case 'left': case 'slight_left': case 'gentle_curve_left': case 'sharp_left': case 'hairpin_left':
+        return Icons.arrow_left;
+      case 'right_turn': case 'right': case 'slight_right': case 'gentle_curve_right': case 'sharp_right': case 'hairpin_right':
+        return Icons.arrow_right;
+      case 't_junction': case 'y_junction':
+        return Icons.merge_type;
+      case 'cross': case 'offset_junction':
+        return Icons.add;
+      case 'roundabout': case 'mini_roundabout':
+        return Icons.replay;
+      case 's_curve': case 'reverse_s_curve':
+        return Icons.swap_horiz;
+      case 'blind_crest':
+        return Icons.trending_up;
+      case 'dip':
+        return Icons.trending_down;
+      case 'narrow_section':
+        return Icons.photo_size_select_small;
+      case 'dead_end':
+        return Icons.block;
+      case 'slip_road':
+        return Icons.merge;
+      default:
+        return Icons.warning_amber_rounded;
+    }
+  }
+
+  String _formatTurnType(String type) {
+    switch (type) {
+      case 'left_turn': case 'left': return 'Left';
+      case 'right_turn': case 'right': return 'Right';
+      case 'slight_left': return 'Slight Left';
+      case 'slight_right': return 'Slight Right';
+      case 'sharp_left': return 'Sharp Left';
+      case 'sharp_right': return 'Sharp Right';
+      case 'hairpin_left': return 'Hairpin Left';
+      case 'hairpin_right': return 'Hairpin Right';
+      case 'gentle_curve_left': return 'Gentle Curve L';
+      case 'gentle_curve_right': return 'Gentle Curve R';
+      case 't_junction': return 'T-Junction';
+      case 'y_junction': return 'Y-Junction';
+      case 'cross': return 'Cross';
+      case 'offset_junction': return 'Offset Junction';
+      case 'roundabout': return 'Roundabout';
+      case 'mini_roundabout': return 'Mini Roundabout';
+      case 'slip_road': return 'Slip Road';
+      case 's_curve': return 'S-Curve';
+      case 'reverse_s_curve': return 'Reverse S-Curve';
+      case 'blind_crest': return 'Blind Crest';
+      case 'dip': return 'Dip';
+      case 'narrow_section': return 'Narrow Road';
+      case 'dead_end': return 'Dead End';
+      case 'complex': return 'Complex Junction';
+      default: return type.replaceAll('_', ' ');
     }
   }
 

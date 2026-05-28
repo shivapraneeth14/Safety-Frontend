@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
+import '../Config/app_config.dart';
 
 class LoginPage extends StatefulWidget {
   const LoginPage({super.key});
@@ -20,7 +21,7 @@ class _LoginPageState extends State<LoginPage> {
     setState(() => loading = true);
 
     final response = await http.post(
-      Uri.parse("https://safety-backend-m5n6.onrender.com/api/Login"),
+      Uri.parse("${AppConfig.baseUrl}/api/Login"),
       headers: {"Content-Type": "application/json"},
       body: jsonEncode({"loginname": loginname, "password": password}),
     );
