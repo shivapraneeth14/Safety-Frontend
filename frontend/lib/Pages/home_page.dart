@@ -184,10 +184,6 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _initLocation() async {
-    // Show map immediately with default position
-    _setDefaultPosition();
-    debugPrint("📍 Default position set — starting GPS background acquisition");
-    // Try GPS in background with retry
     _tryGetGps();
   }
 
@@ -207,7 +203,7 @@ class _HomePageState extends State<HomePage> {
         return;
       }
       if (permission == LocationPermission.deniedForever) {
-        debugPrint("📍 Permission denied forever — giving up");
+        debugPrint("📍 Permission denied forever — cannot get location");
         return;
       }
 
@@ -216,7 +212,6 @@ class _HomePageState extends State<HomePage> {
       );
       _updatePosition(position, initial: true);
 
-      // GPS acquired — start streaming updates
       _positionStream = Geolocator.getPositionStream(
         locationSettings: const LocationSettings(
           accuracy: LocationAccuracy.high,
@@ -224,20 +219,9 @@ class _HomePageState extends State<HomePage> {
         ),
       ).listen((pos) => _updatePosition(pos));
     } catch (e) {
-      debugPrint("⚠️ GPS failed, retrying in 10s: $e");
+      debugPrint("📍 Location failed, retrying in 10s: $e");
       Future.delayed(const Duration(seconds: 10), _tryGetGps);
     }
-  }
-
-  void _setDefaultPosition() {
-    if (!mounted || _currentPosition != null) return;
-    const defaultPos = LatLng(17.3850, 78.4867); // Hyderabad center
-    setState(() {
-      _currentPosition = defaultPos;
-      _fusedPosition = defaultPos;
-    });
-    _mapController.move(defaultPos, _currentZoom);
-    debugPrint("📍 Set default position: 17.3850, 78.4867");
   }
 
   void _updatePosition(Position pos, {bool initial = false}) {
