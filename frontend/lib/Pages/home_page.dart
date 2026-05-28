@@ -184,50 +184,49 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _initLocation() async {
-    debugPrint("📍 Initializing location services...");
+    // Show map immediately with default position
+    _setDefaultPosition();
+    debugPrint("📍 Default position set — starting GPS background acquisition");
+    // Try GPS in background with retry
+    _tryGetGps();
+  }
 
-    bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
-    debugPrint("📍 Location service enabled: $serviceEnabled");
-    if (!serviceEnabled) {
-      debugPrint("⚠️ Location services disabled — using fallback position");
-      _setDefaultPosition();
-      return;
-    }
-
-    LocationPermission permission = await Geolocator.requestPermission();
-    debugPrint("📍 Location permission: $permission");
-    if (permission == LocationPermission.denied ||
-        permission == LocationPermission.deniedForever) {
-      debugPrint("⚠️ Location permission denied — using fallback position");
-      _setDefaultPosition();
-      return;
-    }
-
-    // Fallback: if no GPS fix within 15s, use default position
-    Future.delayed(const Duration(seconds: 15), () {
-      if (mounted && _currentPosition == null) {
-        debugPrint("📍 GPS timeout — using fallback position");
-        _setDefaultPosition();
-      }
-    });
-
+  void _tryGetGps() async {
     try {
+      bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (!serviceEnabled) {
+        debugPrint("📍 Location services disabled — retrying in 10s");
+        Future.delayed(const Duration(seconds: 10), _tryGetGps);
+        return;
+      }
+
+      LocationPermission permission = await Geolocator.requestPermission();
+      if (permission == LocationPermission.denied) {
+        debugPrint("📍 Permission denied — retrying in 10s");
+        Future.delayed(const Duration(seconds: 10), _tryGetGps);
+        return;
+      }
+      if (permission == LocationPermission.deniedForever) {
+        debugPrint("📍 Permission denied forever — giving up");
+        return;
+      }
+
       Position position = await Geolocator.getCurrentPosition(
         desiredAccuracy: LocationAccuracy.high,
       );
       _updatePosition(position, initial: true);
-    } catch (e) {
-      debugPrint("⚠️ getCurrentPosition failed — using fallback: $e");
-      _setDefaultPosition();
-      return;
-    }
 
-    _positionStream = Geolocator.getPositionStream(
-      locationSettings: const LocationSettings(
-        accuracy: LocationAccuracy.high,
-        distanceFilter: 0, // No distance filter for web accuracy
-      ),
-    ).listen((pos) => _updatePosition(pos));
+      // GPS acquired — start streaming updates
+      _positionStream = Geolocator.getPositionStream(
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.high,
+          distanceFilter: 0,
+        ),
+      ).listen((pos) => _updatePosition(pos));
+    } catch (e) {
+      debugPrint("⚠️ GPS failed, retrying in 10s: $e");
+      Future.delayed(const Duration(seconds: 10), _tryGetGps);
+    }
   }
 
   void _setDefaultPosition() {
