@@ -189,7 +189,8 @@ class _HomePageState extends State<HomePage> {
     bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
     debugPrint("📍 Location service enabled: $serviceEnabled");
     if (!serviceEnabled) {
-      debugPrint("⚠️ Location services disabled.");
+      debugPrint("⚠️ Location services disabled — using fallback position");
+      _setDefaultPosition();
       return;
     }
 
@@ -197,14 +198,29 @@ class _HomePageState extends State<HomePage> {
     debugPrint("📍 Location permission: $permission");
     if (permission == LocationPermission.denied ||
         permission == LocationPermission.deniedForever) {
-      debugPrint("⚠️ Location permission denied: $permission");
+      debugPrint("⚠️ Location permission denied — using fallback position");
+      _setDefaultPosition();
       return;
     }
 
-    Position position = await Geolocator.getCurrentPosition(
-      desiredAccuracy: LocationAccuracy.high,
-    );
-    _updatePosition(position, initial: true);
+    // Fallback: if no GPS fix within 15s, use default position
+    Future.delayed(const Duration(seconds: 15), () {
+      if (mounted && _currentPosition == null) {
+        debugPrint("📍 GPS timeout — using fallback position");
+        _setDefaultPosition();
+      }
+    });
+
+    try {
+      Position position = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.high,
+      );
+      _updatePosition(position, initial: true);
+    } catch (e) {
+      debugPrint("⚠️ getCurrentPosition failed — using fallback: $e");
+      _setDefaultPosition();
+      return;
+    }
 
     _positionStream = Geolocator.getPositionStream(
       locationSettings: const LocationSettings(
@@ -212,6 +228,17 @@ class _HomePageState extends State<HomePage> {
         distanceFilter: 0, // No distance filter for web accuracy
       ),
     ).listen((pos) => _updatePosition(pos));
+  }
+
+  void _setDefaultPosition() {
+    if (!mounted || _currentPosition != null) return;
+    const defaultPos = LatLng(17.3850, 78.4867); // Hyderabad center
+    setState(() {
+      _currentPosition = defaultPos;
+      _fusedPosition = defaultPos;
+    });
+    _mapController.move(defaultPos, _currentZoom);
+    debugPrint("📍 Set default position: 17.3850, 78.4867");
   }
 
   void _updatePosition(Position pos, {bool initial = false}) {
