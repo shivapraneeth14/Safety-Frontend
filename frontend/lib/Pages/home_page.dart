@@ -13,6 +13,11 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import '../Config/app_config.dart';
+import 'debug_overlay.dart';
+import 'turn_debug.dart';
+import 'dart:io';
+import 'package:path_provider/path_provider.dart';
+import 'package:share_plus/share_plus.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -86,6 +91,14 @@ class _HomePageState extends State<HomePage> {
   _turnInfo; // { exists, type, distance, intersectionLat, intersectionLng }
   DateTime? _lastTurnCheckTime;
   LatLng? _lastTurnCheckPosition;
+  final TurnDebugInfo _turnDebug = TurnDebugInfo();
+
+  // Session recording
+  bool _isRecording = false;
+  DateTime? _sessionStartTime;
+  List<Map<String, dynamic>> _sessionSnapshots = [];
+  Timer? _recordingTimer;
+  int _recordingSeconds = 0;
 
   // Upcoming turns from backend cone query
   List<Map<String, dynamic>> _upcomingTurns = [];
@@ -798,6 +811,7 @@ class _HomePageState extends State<HomePage> {
         _isSendingData = true;
       });
 
+      _turnDebug.lastWsPayload = payload;
       _ws!.sink.add(jsonEncode(payload));
       _lastDataSent = DateTime.now();
       _lastSentData = payload;
@@ -820,6 +834,75 @@ class _HomePageState extends State<HomePage> {
       debugPrint("❌ Failed to send data: $e - queued for retry");
       _reconnectWebSocket();
     }
+  }
+
+  // ─── Session Recording ───
+
+  String get _headingSourceName {
+    if (_onRoad) return 'road';
+    if (_usingGpsCourse) return 'gps';
+    if (_hasCompassHeading) return 'compass';
+    return 'none';
+  }
+
+  void _startSession() {
+    _sessionSnapshots = [];
+    _sessionStartTime = DateTime.now();
+    _recordingSeconds = 0;
+    _isRecording = true;
+    _recordingTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (mounted) setState(() => _recordingSeconds++);
+    });
+    debugPrint('🔴 Session recording started');
+  }
+
+  Future<void> _stopSessionAndShare() async {
+    _isRecording = false;
+    _recordingTimer?.cancel();
+    _recordingTimer = null;
+    final session = {
+      'app': 'Safety App',
+      'version': '1.0.0',
+      'session': {
+        'startTime': _sessionStartTime?.toIso8601String(),
+        'endTime': DateTime.now().toIso8601String(),
+        'durationSec': _recordingSeconds,
+        'snapshotCount': _sessionSnapshots.length,
+      },
+      'snapshots': _sessionSnapshots,
+    };
+    try {
+      final dir = await getTemporaryDirectory();
+      final fileName = 'safety_session_${DateTime.now().millisecondsSinceEpoch}.json';
+      final file = File('${dir.path}/$fileName');
+      await file.writeAsString(const JsonEncoder.withIndent('  ').convert(session));
+      debugPrint('📁 Session saved: ${file.path}');
+      await Share.shareXFiles(
+        [XFile(file.path)],
+        subject: 'Safety App Debug Session',
+      );
+    } catch (e) {
+      debugPrint('❌ Failed to save/share session: $e');
+    }
+    if (mounted) setState(() {});
+  }
+
+  void _captureSnapshot() {
+    final elapsed = _sessionStartTime != null
+        ? (DateTime.now().difference(_sessionStartTime!).inMilliseconds / 1000.0)
+        : 0.0;
+    final snapshot = _turnDebug.toSnapshot(
+      lat: _fusedPosition?.latitude ?? _currentPosition?.latitude ?? 0,
+      lng: _fusedPosition?.longitude ?? _currentPosition?.longitude ?? 0,
+      speedMs: _lastSpeed ?? 0,
+      headingDeg: _displayHeadingDeg,
+      headingSource: _headingSourceName,
+      activeThreats: List.from(_activeThreats),
+      upcomingTurns: List.from(_upcomingTurns),
+      turnInfo: _turnInfo,
+      elapsedSec: elapsed,
+    );
+    _sessionSnapshots.add(snapshot);
   }
 
   @override
@@ -870,7 +953,10 @@ class _HomePageState extends State<HomePage> {
   Future<void> _maybeScheduleTurnCheck() async {
     try {
       final now = DateTime.now();
-      if (_fusedPosition == null) return;
+      if (_fusedPosition == null) {
+        _turnDebug.skipReason = 'fusedPosition is null';
+        return;
+      }
 
       // Faster speed = more frequent checks
       final speed = _lastSpeed ?? 0;
@@ -899,14 +985,28 @@ class _HomePageState extends State<HomePage> {
                 _lastTurnCheckPosition!.longitude,
               );
 
+        _turnDebug.lastCheckTime = _lastTurnCheckTime;
+        _turnDebug.timeSinceLastCheckSec = dt / 1000;
+        _turnDebug.distSinceLastCheckM = moved;
+        _turnDebug.speedMs = speed;
+        _turnDebug.minIntervalSec = minSeconds;
+        _turnDebug.minDistanceM = minDistance;
+        _turnDebug.shouldRun = !(dt < minSeconds * 1000 && moved < minDistance);
+
         // OR condition — check if EITHER enough time passed OR enough distance moved
         if (dt < minSeconds * 1000 && moved < minDistance) {
+          _turnDebug.skipReason = 'time=${(dt/1000).toStringAsFixed(1)}s < ${minSeconds}s AND dist=${moved.toStringAsFixed(1)}m < ${minDistance}m';
           return;
         }
+      } else {
+        _turnDebug.lastCheckTime = null;
+        _turnDebug.shouldRun = true;
       }
 
+      _turnDebug.skipReason = null;
       await _checkTurnAhead();
     } catch (e) {
+      _turnDebug.skipReason = 'Exception: $e';
       debugPrint('❌ Turn check failed: $e');
     }
   }
@@ -922,11 +1022,20 @@ class _HomePageState extends State<HomePage> {
   LatLng? _lastRoadFetchPosition;
 
   Future<Map<String, dynamic>?> _detectTurnAhead() async {
-    if (_fusedPosition == null) return null;
+    if (_fusedPosition == null) {
+      _turnDebug.cacheTooOld = null;
+      _turnDebug.usingCache = null;
+      _turnDebug.httpStatus = null;
+      _turnDebug.httpError = null;
+      _turnDebug.roadsReturned = null;
+      _turnDebug.fallbackUsed = null;
+      return null;
+    }
 
     final lat = _fusedPosition!.latitude;
     final lon = _fusedPosition!.longitude;
     final scanRadius = _getScanRadius();
+    _turnDebug.scanRadius = scanRadius;
 
     // FIX BUG #36: Use cached road data if within 20m of last fetch
     if (_cachedRoadData != null && _lastRoadFetchPosition != null && _cachedRoadData!.isNotEmpty) {
@@ -934,27 +1043,49 @@ class _HomePageState extends State<HomePage> {
         lat, lon,
         _lastRoadFetchPosition!.latitude, _lastRoadFetchPosition!.longitude,
       );
+      _turnDebug.hasCachedData = true;
+      _turnDebug.cachedDataCount = _cachedRoadData!.length;
+      _turnDebug.distSinceLastFetch = distSinceFetch;
+      _turnDebug.cacheTooOld = distSinceFetch >= 20.0;
       if (distSinceFetch < 20.0) {
+        _turnDebug.usingCache = true;
         debugPrint('🗺️ Using cached road data (moved ${distSinceFetch.toStringAsFixed(1)}m)');
         return _processTurnDataFromElements(_cachedRoadData!, lat, lon, scanRadius);
+      } else {
+        _turnDebug.usingCache = false;
       }
+    } else {
+      _turnDebug.hasCachedData = (_cachedRoadData != null && _cachedRoadData!.isNotEmpty);
+      _turnDebug.cachedDataCount = (_cachedRoadData?.length ?? 0);
+      _turnDebug.distSinceLastFetch = null;
+      _turnDebug.cacheTooOld = null;
+      _turnDebug.usingCache = false;
     }
 
     Map<String, dynamic>? data;
+    _turnDebug.fallbackUsed = false;
     try {
       final url = Uri.parse(
         "${AppConfig.baseUrl}/api/nearby-roads"
         "?lat=$lat&lon=$lon&radius=$scanRadius",
       );
+      _turnDebug.fetchUrl = url.toString();
       final res = await http.get(url).timeout(const Duration(seconds: 5));
+      _turnDebug.httpStatus = res.statusCode;
 
       if (res.statusCode == 200) {
         data = jsonDecode(res.body);
-        debugPrint('✅ Nearby roads query succeeded');
+        _turnDebug.roadsReturned = (data?['elements'] as List?)?.length ?? 0;
+        debugPrint('✅ Nearby roads query succeeded: ${_turnDebug.roadsReturned} roads');
+      } else {
+        _turnDebug.httpError = 'Status ${res.statusCode}';
       }
     } catch (e) {
+      _turnDebug.httpError = e.toString();
+      _turnDebug.roadsReturned = null;
       debugPrint('⚠️ Nearby roads query failed: $e');
       if (_cachedRoadData != null && _cachedRoadData!.isNotEmpty) {
+        _turnDebug.fallbackUsed = true;
         debugPrint('🗺️ Falling back to cached road data');
         return _processTurnDataFromElements(_cachedRoadData!, lat, lon, scanRadius);
       }
@@ -970,6 +1101,7 @@ class _HomePageState extends State<HomePage> {
 
     debugPrint('⚠️ No roads found nearby');
     if (_cachedRoadData != null && _cachedRoadData!.isNotEmpty) {
+      _turnDebug.fallbackUsed = true;
       debugPrint('🗺️ Falling back to cached road data');
       return _processTurnDataFromElements(_cachedRoadData!, lat, lon, scanRadius);
     }
@@ -977,8 +1109,10 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<Map<String, dynamic>?> _processTurnDataFromElements(List<dynamic> elements, double lat, double lon, double scanRadius) async {
+    _turnDebug.phase1Entries.clear();
+    _turnDebug.phase2Entries.clear();
+    _turnDebug.elementsCount = elements.length;
 
-    // Find the way with the closest segment to the user's position
     dynamic bestWay;
     int bestSegmentIndex = 0;
     double bestSegmentDist = double.infinity;
@@ -988,19 +1122,14 @@ class _HomePageState extends State<HomePage> {
       final geom = el['geometry'] as List<dynamic>;
       if (geom.length < 2) continue;
 
-      // Convert to LatLng list
       final points = geom
           .map((p) => LatLng(p['lat'] as double, p['lon'] as double))
           .toList();
 
-      // Find the closest segment (line between two consecutive points)
       for (int i = 0; i < points.length - 1; i++) {
         final p1 = points[i];
         final p2 = points[i + 1];
-
-        // Calculate distance from user to the segment
         final distToSegment = _distanceToSegment(lat, lon, p1, p2);
-
         if (distToSegment < bestSegmentDist) {
           bestSegmentDist = distToSegment;
           bestWay = el;
@@ -1010,33 +1139,45 @@ class _HomePageState extends State<HomePage> {
     }
 
     if (bestWay == null) {
+      _turnDebug.bestWayId = 'null';
       debugPrint('⚠️ No suitable way found');
+      _turnDebug.detectResult = {'error': 'No suitable way found'};
       return null;
     }
 
-    final geom = bestWay['geometry'] as List<dynamic>;
-    if (geom.length < 2) return null;
+    _turnDebug.bestWayId = bestWay['id']?.toString();
+    _turnDebug.bestWayHighway = bestWay['highway']?.toString();
+    _turnDebug.bestWayName = bestWay['name']?.toString();
+    _turnDebug.bestSegmentDist = bestSegmentDist;
+    _turnDebug.bestSegmentIndex = bestSegmentIndex;
 
-    // Convert to LatLng list
+    final geom = bestWay['geometry'] as List<dynamic>;
+    if (geom.length < 2) {
+      _turnDebug.detectResult = {'error': 'Geometry too short'};
+      return null;
+    }
+
     final points = geom
         .map((p) => LatLng(p['lat'] as double, p['lon'] as double))
         .toList();
 
     final nodes = bestWay['nodes'] as List?;
-
     int startIndex = bestSegmentIndex;
 
-    // Determine which direction the vehicle is traveling along the way
     final segBearing = _bearing(points[startIndex], points[startIndex + 1]);
     double headingDiff = (_lastHeading ?? segBearing) - segBearing;
     if (headingDiff > 180) headingDiff -= 360;
     if (headingDiff < -180) headingDiff += 360;
     final goingForward = headingDiff.abs() <= 90;
-    debugPrint('🧭 heading=$_lastHeading segBearing=${segBearing.toStringAsFixed(0)}° diff=${headingDiff.toStringAsFixed(0)}° goingForward=$goingForward');
+    _turnDebug.goingForward = goingForward;
+    _turnDebug.totalPoints = points.length;
 
-    // ─── PHASE 1: Junction detection (node shared with other roads) ───
+    // ─── PHASE 1: Junction detection ───
     if (nodes != null && nodes.isNotEmpty) {
-      // Build node-to-ways index
+      _turnDebug.phase1Executed = true;
+      _turnDebug.hasNodes = true;
+      _turnDebug.nodeCount = nodes.length;
+
       final Map<int, List<int>> nodeToWays = {};
       final bestWayId = bestWay['id'] as int;
       for (final el in elements) {
@@ -1047,13 +1188,15 @@ class _HomePageState extends State<HomePage> {
         }
       }
 
-      // Index other way geometries for direction lookup
       final Map<int, List> otherGeoms = {};
       for (final el in elements) {
         if (el['type'] == 'way' && el['id'] != bestWayId && el['geometry'] != null) {
           otherGeoms[el['id'] as int] = el['geometry'] as List;
         }
       }
+
+      _turnDebug.nodeToWaysCount = nodeToWays.length;
+      _turnDebug.waysCount = elements.where((e) => e['type'] == 'way').length;
 
       final int scanLimit = goingForward
           ? (nodes.length < points.length ? nodes.length : points.length)
@@ -1066,14 +1209,22 @@ class _HomePageState extends State<HomePage> {
 
         final nodeId = nodes[j] as int;
         final waysHere = nodeToWays[nodeId] ?? [];
-        if (waysHere.length <= 1) continue;
+        final isJunction = waysHere.length > 1;
 
-        // Approach bearing depends on travel direction
+        _turnDebug.phase1Entries.add(Phase1Entry(
+          nodeIndex: j,
+          nodeId: nodeId,
+          waysHere: waysHere.length,
+          distance: dist,
+          isJunction: isJunction,
+        ));
+
+        if (!isJunction) continue;
+
         final approach = goingForward
             ? _bearing(points[j > 0 ? j - 1 : 0], points[j])
             : _bearing(points[j + 1 < points.length ? j + 1 : points.length - 1], points[j]);
 
-        // Check each other way at this node
         final sideRoads = <String>{};
         for (final otherId in waysHere) {
           if (otherId == bestWayId) continue;
@@ -1114,14 +1265,12 @@ class _HomePageState extends State<HomePage> {
           }
         }
 
-        // Check if vehicle's own road continues past this node (in travel direction)
         final hasStraight = goingForward
             ? (j + 1 < points.length)
             : (j > 0);
         final dirs = Set<String>.from(sideRoads);
         if (hasStraight) dirs.add("straight");
 
-        // Classify junction
         String type;
         if (dirs.contains("straight") && dirs.length >= 3) {
           type = "cross";
@@ -1135,22 +1284,47 @@ class _HomePageState extends State<HomePage> {
           continue;
         }
 
-        debugPrint('🚧 $type at ${dist.toStringAsFixed(1)}m — $dirs');
-        return {
+        _turnDebug.phase1Entries.last.junctionType = type;
+        _turnDebug.phase1Entries.last.junctionDetails = {
+          'approach': approach,
+          'dirs': dirs.toList(),
+          'sideRoads': sideRoads.toList(),
+          'hasStraight': hasStraight,
+        };
+
+        _turnDebug.phase1EarlyReturned = true;
+        _turnDebug.phase1ReturnType = type;
+        _turnDebug.phase1ReturnDist = dist;
+
+        debugPrint('🚧 Phase1 early return: $type at ${dist.toStringAsFixed(1)}m — $dirs');
+        final result = {
           "exists": true,
           "type": type,
           "distance": dist,
           "intersectionLat": points[j].latitude,
           "intersectionLng": points[j].longitude,
         };
+        _turnDebug.detectResult = result;
+        return result;
       }
+    } else {
+      _turnDebug.phase1Executed = true;
+      _turnDebug.hasNodes = false;
+      _turnDebug.nodeCount = nodes?.length ?? 0;
     }
 
-    // ─── PHASE 2: Road bend detection (L-shape on same road) ───
+    // ─── PHASE 2: Road bend detection ───
+    _turnDebug.phase2Executed = true;
+    _turnDebug.bendThreshold = 45.0;
+    _turnDebug.maxAngleChange = 0;
+    _turnDebug.segmentsWithinRadius = 0;
+
     if (goingForward) {
       for (int j = startIndex; j + 2 < points.length; j++) {
         final dist = _distance(lat, lon, points[j + 1].latitude, points[j + 1].longitude);
         if (dist > scanRadius) break;
+
+        _turnDebug.segmentsWithinRadius = (_turnDebug.segmentsWithinRadius ?? 0) + 1;
 
         final b1 = _bearing(points[j], points[j + 1]);
         final b2 = _bearing(points[j + 1], points[j + 2]);
@@ -1158,16 +1332,34 @@ class _HomePageState extends State<HomePage> {
         if (angleChange > 180) angleChange -= 360;
         if (angleChange < -180) angleChange += 360;
 
-        if (angleChange.abs() >= 45.0) {
+        final above = angleChange.abs() >= 45.0;
+        if (angleChange.abs() > (_turnDebug.maxAngleChange ?? 0)) {
+          _turnDebug.maxAngleChange = angleChange.abs();
+        }
+
+        _turnDebug.phase2Entries.add(Phase2Entry(
+          segmentIndex: j,
+          distance: dist,
+          bearing1: b1,
+          bearing2: b2,
+          angleChange: angleChange,
+          aboveThreshold: above,
+        ));
+
+        if (above) {
           final type = angleChange > 0 ? "right_bend" : "left_bend";
+          _turnDebug.bendDetected = true;
+          _turnDebug.phase2Result = '$type at ${dist.toStringAsFixed(1)}m';
           debugPrint('↩️ $type at ${dist.toStringAsFixed(1)}m (angle: ${angleChange.toStringAsFixed(1)}°)');
-          return {
+          final result = {
             "exists": true,
             "type": type,
             "distance": dist,
             "intersectionLat": points[j + 1].latitude,
             "intersectionLng": points[j + 1].longitude,
           };
+          _turnDebug.detectResult = result;
+          return result;
         }
       }
     } else {
@@ -1175,27 +1367,50 @@ class _HomePageState extends State<HomePage> {
         final dist = _distance(lat, lon, points[j - 1].latitude, points[j - 1].longitude);
         if (dist > scanRadius) break;
 
+        _turnDebug.segmentsWithinRadius = (_turnDebug.segmentsWithinRadius ?? 0) + 1;
+
         final b1 = _bearing(points[j], points[j - 1]);
         final b2 = _bearing(points[j - 1], points[j - 2]);
         double angleChange = b2 - b1;
         if (angleChange > 180) angleChange -= 360;
         if (angleChange < -180) angleChange += 360;
 
-        if (angleChange.abs() >= 45.0) {
+        final above = angleChange.abs() >= 45.0;
+        if (angleChange.abs() > (_turnDebug.maxAngleChange ?? 0)) {
+          _turnDebug.maxAngleChange = angleChange.abs();
+        }
+
+        _turnDebug.phase2Entries.add(Phase2Entry(
+          segmentIndex: j,
+          distance: dist,
+          bearing1: b1,
+          bearing2: b2,
+          angleChange: angleChange,
+          aboveThreshold: above,
+        ));
+
+        if (above) {
           final type = angleChange > 0 ? "right_bend" : "left_bend";
-          debugPrint('↩️ $type at ${dist.toStringAsFixed(1)}m (angle: ${angleChange.toStringAsFixed(1)}°)');
-          return {
+          _turnDebug.bendDetected = true;
+          _turnDebug.phase2Result = '$type at ${dist.toStringAsFixed(1)}m';
+          final result = {
             "exists": true,
             "type": type,
             "distance": dist,
             "intersectionLat": points[j - 1].latitude,
             "intersectionLng": points[j - 1].longitude,
           };
+          _turnDebug.detectResult = result;
+          return result;
         }
       }
     }
 
-    return {"exists": false, "distance": null};
+    _turnDebug.bendDetected = false;
+    _turnDebug.phase2Result = 'No angle ≥ 45° (max: ${_turnDebug.maxAngleChange?.toStringAsFixed(1)}°)';
+    final noneResult = {"exists": false, "distance": null};
+    _turnDebug.detectResult = noneResult;
+    return noneResult;
   }
 
   // Helper function to calculate distance from a point to a line segment
@@ -1252,15 +1467,26 @@ class _HomePageState extends State<HomePage> {
       _lastTurnCheckTime = now;
       _lastTurnCheckPosition = _fusedPosition;
 
+      _turnDebug.detectResult = result;
+      _turnDebug.turnInfoApplied = result ?? {"exists": false, "distance": null};
+      _turnDebug.turnExists = result?['exists'] == true;
+      _turnDebug.turnType = result?['type']?.toString();
+      _turnDebug.turnDistance = result?['distance']?.toDouble();
+
+      if (mounted && _isRecording) {
+        _captureSnapshot();
+      }
+
       if (mounted) {
         setState(() {
-          // Always set turnInfo, even if null (will show as false/None/N/A in UI)
           _turnInfo = result ?? {"exists": false, "distance": null};
         });
       }
     } catch (e) {
+      _turnDebug.httpError = 'Exception in _checkTurnAhead: $e';
+      _turnDebug.turnInfoApplied = {"exists": false, "distance": null};
+      _turnDebug.turnExists = false;
       debugPrint('❌ _checkTurnAhead error: $e');
-      // On error, set to no turn detected
       if (mounted) {
         setState(() {
           _turnInfo = {"exists": false, "distance": null};
@@ -1567,7 +1793,7 @@ class _HomePageState extends State<HomePage> {
                     child: const Icon(Icons.my_location),
                   ),
                 ),
-                // Data Viewer Button
+                // Debug Overlay Button
                 Positioned(
                   bottom: 90,
                   right: 20,
@@ -1584,204 +1810,46 @@ class _HomePageState extends State<HomePage> {
                       });
                     },
                     child: Icon(
-                      _showDataViewer ? Icons.close : Icons.data_usage,
+                      _showDataViewer ? Icons.close : Icons.bug_report,
                     ),
                   ),
                 ),
-                // Data Viewer Overlay
+                // Debug Overlay (covers screen when open)
                 if (_showDataViewer)
                   Positioned(
-                    top: 100,
-                    left: 20,
-                    right: 20,
-                    child: Container(
-                      padding: const EdgeInsets.all(16),
-                      decoration: BoxDecoration(
-                        color: Colors.black87,
-                        borderRadius: BorderRadius.circular(12),
-                        boxShadow: [
-                          BoxShadow(
-                            color: Colors.black.withOpacity(0.3),
-                            blurRadius: 8,
-                            offset: const Offset(0, 4),
-                          ),
-                        ],
+                    top: 80,
+                    left: 10,
+                    right: 10,
+                    bottom: 10,
+                    child: DebugOverlay(
+                          debug: _turnDebug,
+                          lastSentData: _lastSentData,
+                          activeThreats: _activeThreats,
+                          upcomingTurns: _upcomingTurns,
+                          isConnected: _isConnected,
+                          connectionStatus: _connectionStatus,
+                          isSendingData: _isSendingData,
+                          displayHeadingDeg: _displayHeadingDeg,
+                          onRoad: _onRoad,
+                          headingRaw: _lastHeading,
+                          hasCompassHeading: _hasCompassHeading,
+                          usingGpsCourse: _usingGpsCourse,
+                          pendingMessagesCount: _pendingMessages.length,
+                          turnExists: _turnInfo != null && _turnInfo!['exists'] == true,
+                          turnType: _turnInfo?['type']?.toString(),
+                          turnDistance: _turnInfo?['distance']?.toDouble(),
+                          turnInfo: _turnInfo,
+                          onClose: () {
+                            setState(() {
+                              _showDataViewer = false;
+                            });
+                          },
+                          isRecording: _isRecording,
+                          recordingSeconds: _recordingSeconds,
+                          snapshotCount: _sessionSnapshots.length,
+                          onStartRecording: _startSession,
+                          onStopRecording: _stopSessionAndShare,
                       ),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          // Header
-                          Row(
-                            children: [
-                              const Icon(Icons.data_usage, color: Colors.white),
-                              const SizedBox(width: 8),
-                              const Text(
-                                'Data Being Sent',
-                                style: TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 18,
-                                  fontWeight: FontWeight.bold,
-                                ),
-                              ),
-                              const Spacer(),
-                              IconButton(
-                                onPressed: () {
-                                  setState(() {
-                                    _showDataViewer = false;
-                                  });
-                                },
-                                icon: const Icon(
-                                  Icons.close,
-                                  color: Colors.white,
-                                ),
-                              ),
-                            ],
-                          ),
-                          const SizedBox(height: 12),
-                          // Data Content
-                          if (_lastSentData != null) ...[
-                            _buildDataItem(
-                              'User ID',
-                              _lastSentData!['userId']?.toString() ?? 'N/A',
-                            ),
-                            _buildDataItem(
-                              'Latitude',
-                              _lastSentData!['latitude']?.toString() ?? 'N/A',
-                            ),
-                            _buildDataItem(
-                              'Longitude',
-                              _lastSentData!['longitude']?.toString() ?? 'N/A',
-                            ),
-                            _buildDataItem(
-                              'Speed',
-                              _lastSentData!['speed']?.toString() ?? 'N/A',
-                            ),
-                            _buildDataItem(
-                              'Heading',
-                              _lastSentData!['heading']?.toString() ?? 'N/A',
-                            ),
-                            _buildDataItem(
-                              'Connectivity',
-                              _lastSentData!['connectivity']?.toString() ??
-                                  'N/A',
-                            ),
-                            _buildDataItem(
-                              'Timestamp',
-                              _lastSentData!['timestamp']?.toString() ?? 'N/A',
-                            ),
-                            // Sensor data
-                            if (_lastSentData!['accel'] != null)
-                              _buildDataItem(
-                                'Accelerometer',
-                                'X: ${_lastSentData!['accel']['x']?.toStringAsFixed(2)}, Y: ${_lastSentData!['accel']['y']?.toStringAsFixed(2)}, Z: ${_lastSentData!['accel']['z']?.toStringAsFixed(2)}',
-                              ),
-                            if (_lastSentData!['gyro'] != null)
-                              _buildDataItem(
-                                'Gyroscope',
-                                'X: ${_lastSentData!['gyro']['x']?.toStringAsFixed(4)}, Y: ${_lastSentData!['gyro']['y']?.toStringAsFixed(4)}, Z: ${_lastSentData!['gyro']['z']?.toStringAsFixed(4)}',
-                              ),
-                            if (_lastSentData!['magnetometer'] != null)
-                              _buildDataItem(
-                                'Magnetometer',
-                                'X: ${_lastSentData!['magnetometer']['x']?.toStringAsFixed(2)}, Y: ${_lastSentData!['magnetometer']['y']?.toStringAsFixed(2)}, Z: ${_lastSentData!['magnetometer']['z']?.toStringAsFixed(2)}',
-                              ),
-                          ] else ...[
-                            const Text(
-                              'No data sent yet',
-                              style: TextStyle(color: Colors.grey),
-                            ),
-                          ],
-                          const SizedBox(height: 12),
-                          // Turn info display (frontend only)
-                          const Divider(color: Colors.white12),
-                          const SizedBox(height: 8),
-                          _buildDataItem(
-                            'Turn Ahead',
-                            _turnInfo != null && _turnInfo!['exists'] == true
-                                ? 'true'
-                                : 'false',
-                          ),
-                          _buildDataItem(
-                            'Turn Type',
-                            _turnInfo != null && _turnInfo!['exists'] == true
-                                ? (_turnInfo!['type']?.toString() ?? 'None')
-                                : 'None',
-                          ),
-                          _buildDataItem(
-                            'Turn Distance',
-                            _turnInfo != null && _turnInfo!['distance'] != null
-                                ? "${(_turnInfo!['distance'] as double).toStringAsFixed(1)} meters"
-                                : 'N/A',
-                          ),
-                          _buildDataItem(
-                            'Intersection Lat',
-                            _turnInfo?['intersectionLat']?.toString() ?? 'N/A',
-                          ),
-                          _buildDataItem(
-                            'Intersection Lng',
-                            _turnInfo?['intersectionLng']?.toString() ?? 'N/A',
-                          ),
-                          const SizedBox(height: 16),
-                          // Action Buttons
-                          Row(
-                            children: [
-                              Expanded(
-                                child: ElevatedButton.icon(
-                                  onPressed: () {
-                                    // Clear all stored data
-                                    setState(() {
-                                      _lastSentData = null;
-                                    });
-                                    ScaffoldMessenger.of(context).showSnackBar(
-                                      const SnackBar(
-                                        content: Text(
-                                          'Data cleared from display',
-                                        ),
-                                        backgroundColor: Colors.green,
-                                      ),
-                                    );
-                                  },
-                                  icon: const Icon(Icons.clear_all),
-                                  label: const Text('Clear Data'),
-                                  style: ElevatedButton.styleFrom(
-                                    backgroundColor: Colors.red,
-                                    foregroundColor: Colors.white,
-                                  ),
-                                ),
-                              ),
-                              const SizedBox(width: 12),
-                              Expanded(
-                                child: ElevatedButton.icon(
-                                  onPressed: () {
-                                    // Copy data to clipboard
-                                    if (_lastSentData != null) {
-                                      // You can implement clipboard functionality here
-                                      ScaffoldMessenger.of(
-                                        context,
-                                      ).showSnackBar(
-                                        const SnackBar(
-                                          content: Text(
-                                            'Data copied to clipboard',
-                                          ),
-                                          backgroundColor: Colors.blue,
-                                        ),
-                                      );
-                                    }
-                                  },
-                                  icon: const Icon(Icons.copy),
-                                  label: const Text('Copy'),
-                                  style: ElevatedButton.styleFrom(
-                                    backgroundColor: Colors.blue,
-                                    foregroundColor: Colors.white,
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ],
-                      ),
-                    ),
                   ),
                 // ─── Turn/junction info card at bottom ───
                 if (_turnInfo != null && _turnInfo!['exists'] == true)
