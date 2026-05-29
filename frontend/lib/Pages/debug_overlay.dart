@@ -28,6 +28,7 @@ class DebugOverlay extends StatelessWidget {
   final int snapshotCount;
   final VoidCallback? onStartRecording;
   final VoidCallback? onStopRecording;
+  final VoidCallback? onListRecordings;
 
   const DebugOverlay({
     super.key,
@@ -55,6 +56,7 @@ class DebugOverlay extends StatelessWidget {
     this.snapshotCount = 0,
     this.onStartRecording,
     this.onStopRecording,
+    this.onListRecordings,
   });
 
   @override
@@ -104,7 +106,7 @@ class DebugOverlay extends StatelessWidget {
             _section('RECORDING', _recordingContent(), Colors.redAccent),
             _section('RAW DEBUG JSON', _rawJsonContent(), Colors.grey),
             const SizedBox(height: 12),
-            _CopyButton(debug: debug, lastSentData: lastSentData, onClose: onClose),
+            _CopyButton(debug: debug, lastSentData: lastSentData, onClose: onClose, onListRecordings: onListRecordings),
           ],
         ),
       ),
@@ -610,49 +612,70 @@ class _CopyButton extends StatelessWidget {
   final TurnDebugInfo debug;
   final Map<String, dynamic>? lastSentData;
   final VoidCallback? onClose;
+  final VoidCallback? onListRecordings;
 
-  const _CopyButton({required this.debug, this.lastSentData, this.onClose});
+  const _CopyButton({required this.debug, this.lastSentData, this.onClose, this.onListRecordings});
 
   @override
   Widget build(BuildContext context) {
-    return Row(
+    return Column(
       children: [
-        Expanded(
-          child: ElevatedButton.icon(
-            onPressed: () {
-              final full = {
-                'debug': debug.toJson(),
-                'lastSentData': lastSentData,
-              };
-              Clipboard.setData(ClipboardData(
-                text: const JsonEncoder.withIndent('  ').convert(full),
-              ));
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('All debug data copied to clipboard')),
-              );
-            },
-            icon: const Icon(Icons.copy, size: 14),
-            label: const Text('Copy All', style: TextStyle(fontSize: 11)),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.blueGrey,
-              foregroundColor: Colors.white,
-              padding: const EdgeInsets.symmetric(vertical: 8),
+        Row(
+          children: [
+            Expanded(
+              child: ElevatedButton.icon(
+                onPressed: () {
+                  final full = {
+                    'debug': debug.toJson(),
+                    'lastSentData': lastSentData,
+                  };
+                  Clipboard.setData(ClipboardData(
+                    text: const JsonEncoder.withIndent('  ').convert(full),
+                  ));
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('All debug data copied to clipboard')),
+                  );
+                },
+                icon: const Icon(Icons.copy, size: 14),
+                label: const Text('Copy All', style: TextStyle(fontSize: 11)),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.blueGrey,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 8),
+                ),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: ElevatedButton.icon(
+                onPressed: onClose,
+                icon: const Icon(Icons.close, size: 14),
+                label: const Text('Close', style: TextStyle(fontSize: 11)),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.red.shade800,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 8),
+                ),
+              ),
+            ),
+          ],
+        ),
+        if (onListRecordings != null) ...[
+          const SizedBox(height: 8),
+          SizedBox(
+            width: double.infinity,
+            child: ElevatedButton.icon(
+              onPressed: onListRecordings,
+              icon: const Icon(Icons.folder_open, size: 14),
+              label: const Text('View Saved Recordings', style: TextStyle(fontSize: 11)),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.indigo,
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(vertical: 8),
+              ),
             ),
           ),
-        ),
-        const SizedBox(width: 8),
-        Expanded(
-          child: ElevatedButton.icon(
-            onPressed: onClose,
-            icon: const Icon(Icons.close, size: 14),
-            label: const Text('Close', style: TextStyle(fontSize: 11)),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.red.shade800,
-              foregroundColor: Colors.white,
-              padding: const EdgeInsets.symmetric(vertical: 8),
-            ),
-          ),
-        ),
+        ],
       ],
     );
   }

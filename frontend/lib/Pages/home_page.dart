@@ -878,9 +878,11 @@ class _HomePageState extends State<HomePage> {
       'snapshots': _sessionSnapshots,
     };
     try {
-      final dir = await getTemporaryDirectory();
+      final dir = await getApplicationDocumentsDirectory();
+      final sessionsDir = Directory('${dir.path}/debug_sessions');
+      if (!await sessionsDir.exists()) await sessionsDir.create();
       final fileName = 'safety_session_${DateTime.now().millisecondsSinceEpoch}.json';
-      final file = File('${dir.path}/$fileName');
+      final file = File('${sessionsDir.path}/$fileName');
       await file.writeAsString(const JsonEncoder.withIndent('  ').convert(session));
       debugPrint('📁 Session saved: ${file.path}');
       await Share.shareXFiles(
@@ -909,6 +911,116 @@ class _HomePageState extends State<HomePage> {
       elapsedSec: elapsed,
     );
     _sessionSnapshots.add(snapshot);
+  }
+
+  Future<List<File>> _getRecordingFiles() async {
+    try {
+      final dir = await getApplicationDocumentsDirectory();
+      final sessionsDir = Directory('${dir.path}/debug_sessions');
+      if (!await sessionsDir.exists()) return [];
+      final files = await sessionsDir.list().where(
+        (f) => f is File && f.path.endsWith('.json') && f.path.contains('safety_session_'),
+      ).cast<File>().toList();
+      files.sort((a, b) => b.lastModifiedSync().compareTo(a.lastModifiedSync()));
+      return files;
+    } catch (_) {
+      return [];
+    }
+  }
+
+  Future<void> _shareRecording(String filePath) async {
+    try {
+      await Share.shareXFiles([XFile(filePath)], subject: 'Safety App Debug Session');
+    } catch (e) {
+      debugPrint('❌ Failed to share recording: $e');
+    }
+  }
+
+  Future<void> _deleteRecording(String filePath) async {
+    try {
+      await File(filePath).delete();
+      if (mounted) setState(() {});
+    } catch (e) {
+      debugPrint('❌ Failed to delete recording: $e');
+    }
+  }
+
+  Future<void> _showRecordingsBottomSheet() async {
+    final files = await _getRecordingFiles();
+    if (!mounted || files.isEmpty) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('No recordings found')),
+        );
+      }
+      return;
+    }
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.black87,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (ctx) {
+        return Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  const Icon(Icons.folder_open, color: Colors.white, size: 20),
+                  const SizedBox(width: 8),
+                  const Text('Saved Recordings', style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.bold)),
+                  const Spacer(),
+                  IconButton(
+                    icon: const Icon(Icons.close, color: Colors.white54),
+                    onPressed: () => Navigator.pop(ctx),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 12),
+              SizedBox(
+                height: files.length > 5 ? 300 : files.length * 72.0,
+                child: ListView.builder(
+                  itemCount: files.length,
+                  itemBuilder: (_, i) {
+                    final f = files[i];
+                    final size = f.lengthSync();
+                    final modified = f.lastModifiedSync();
+                    final name = f.uri.pathSegments.last;
+                    final sizeStr = size > 1024 ? '${(size / 1024).toStringAsFixed(1)} KB' : '${size} B';
+                    return Card(
+                      color: Colors.white10,
+                      margin: const EdgeInsets.only(bottom: 6),
+                      child: ListTile(
+                        dense: true,
+                        title: Text(name, style: const TextStyle(color: Colors.white, fontSize: 12)),
+                        subtitle: Text('$sizeStr • ${modified.toString().substring(0, 19)}', style: const TextStyle(color: Colors.white38, fontSize: 10)),
+                        trailing: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            IconButton(
+                              icon: const Icon(Icons.share, color: Colors.blue, size: 18),
+                              onPressed: () { Navigator.pop(ctx); _shareRecording(f.path); },
+                            ),
+                            IconButton(
+                              icon: const Icon(Icons.delete, color: Colors.red, size: 18),
+                              onPressed: () { _deleteRecording(f.path); Navigator.pop(ctx); },
+                            ),
+                          ],
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
   }
 
   @override
@@ -1855,6 +1967,7 @@ class _HomePageState extends State<HomePage> {
                           snapshotCount: _sessionSnapshots.length,
                           onStartRecording: _startSession,
                           onStopRecording: _stopSessionAndShare,
+                          onListRecordings: _showRecordingsBottomSheet,
                       ),
                   ),
                 // ─── Turn/junction info card at bottom ───
