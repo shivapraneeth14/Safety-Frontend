@@ -522,47 +522,43 @@ class _HomePageState extends State<HomePage> {
   void _connectWebSocket() {
     try {
       _ws?.sink.close(); // Close existing connection if any
+      _sendTimer?.cancel();
       // FIX BUG #2: Pass JWT token as query parameter for WebSocket auth
       final wsUrlFuture = _getWsUrlWithToken();
-      wsUrlFuture.then((wsUrl) {
+      wsUrlFuture.then((wsUrl) async {
         _ws = WebSocketChannel.connect(Uri.parse(wsUrl));
         debugPrint('🔗 Connecting to WebSocket with auth');
+        await _ws!.ready;
+        debugPrint('✅ WebSocket connected successfully');
+        setState(() {
+          _isConnected = true;
+          _connectionStatus = 'Connected';
+        });
+        // Flush pending messages on reconnect
+        // FIX BUG #28: Send queued messages
+        if (_pendingMessages.isNotEmpty) {
+          debugPrint('📤 Flushing ${_pendingMessages.length} pending messages');
+          for (final pm in _pendingMessages) {
+            try {
+              _ws!.sink.add(jsonEncode(pm));
+            } catch (e) {
+              debugPrint('❌ Failed to flush pending message: $e');
+            }
+          }
+          _pendingMessages.clear();
+        }
+        // Start sending data every second
+        _sendTimer = Timer.periodic(const Duration(seconds: 1), (_) async {
+          _sendWebSocket();
+        });
 
-        bool wsReady = false;
         _ws!.stream.listen(
           (msg) {
-            if (!wsReady) {
-              wsReady = true;
-              debugPrint('✅ WebSocket connected successfully');
-              setState(() {
-                _isConnected = true;
-                _connectionStatus = 'Connected';
-              });
-              // Start sending data every second (only after confirmed connection)
-              _sendTimer?.cancel();
-              _sendTimer = Timer.periodic(const Duration(seconds: 1), (_) async {
-                _sendWebSocket();
-              });
-              // Flush pending messages on reconnect
-              // FIX BUG #28: Send queued messages
-              if (_pendingMessages.isNotEmpty) {
-                debugPrint('📤 Flushing ${_pendingMessages.length} pending messages');
-                for (final pm in _pendingMessages) {
-                  try {
-                    _ws!.sink.add(jsonEncode(pm));
-                  } catch (e) {
-                    debugPrint('❌ Failed to flush pending message: $e');
-                  }
-                }
-                _pendingMessages.clear();
-              }
-            }
             debugPrint('📥 WS Message: $msg');
             _handleWsMessage(msg);
           },
 
           onDone: () {
-            wsReady = false;
             debugPrint('ℹ️ WebSocket closed - attempting to reconnect...');
             setState(() {
               _isConnected = false;
@@ -571,7 +567,6 @@ class _HomePageState extends State<HomePage> {
             _reconnectWebSocket();
           },
           onError: (e) {
-            wsReady = false;
             debugPrint('❌ WebSocket error: $e - attempting to reconnect...');
             setState(() {
               _isConnected = false;
