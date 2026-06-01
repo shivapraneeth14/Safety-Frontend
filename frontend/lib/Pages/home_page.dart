@@ -13,11 +13,176 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import '../Config/app_config.dart';
+import '../Services/session_recorder.dart';
 import 'debug_overlay.dart';
 import 'turn_debug.dart';
 import 'dart:io';
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
+
+class KalmanFilter {
+  double lat, lon, vLat, vLon;
+  double p00, p01, p10, p11;
+  double p22, p33;
+  double processNoisePos, processNoiseVel;
+  double lastTimestamp;
+  bool initialized;
+
+  KalmanFilter()
+      : lat = 0,
+        lon = 0,
+        vLat = 0,
+        vLon = 0,
+        p00 = 1, p01 = 0, p10 = 0, p11 = 1,
+        p22 = 1, p33 = 1,
+        processNoisePos = 0.1,
+        processNoiseVel = 0.5,
+        lastTimestamp = 0,
+        initialized = false;
+
+  void init(double latitude, double longitude, double accuracy, double timestamp) {
+    lat = latitude;
+    lon = longitude;
+    vLat = 0;
+    vLon = 0;
+    p00 = accuracy * accuracy;
+    p11 = accuracy * accuracy;
+    p22 = 5.0;
+    p33 = 5.0;
+    lastTimestamp = timestamp;
+    initialized = true;
+  }
+
+  void predict(double timestamp, {double gyroZ = 0, double accelMagnitude = 0, double speed = 0}) {
+    if (!initialized) return;
+    final dt = (timestamp - lastTimestamp) / 1000.0;
+    if (dt <= 0 || dt > 5.0) {
+      lastTimestamp = timestamp;
+      return;
+    }
+
+    lat += vLat * dt;
+    lon += vLon * dt;
+
+    final gyroActivity = gyroZ.abs() > 0.5 ? (gyroZ.abs() / 10.0) : 0.0;
+    final accelActivity = accelMagnitude > 2.0 ? (accelMagnitude / 20.0) : 0.0;
+    final activityFactor = 1.0 + gyroActivity + accelActivity;
+
+    final qPos = processNoisePos * activityFactor;
+    final qVel = processNoiseVel * activityFactor;
+
+    final dt2 = dt * dt;
+    final dt3 = dt2 * dt;
+    final dt4 = dt3 * dt;
+
+    p00 += p22 * dt2 + qPos * dt4 / 4;
+    p01 += p33 * dt2;
+    p10 += p22 * dt2;
+    p11 += p33 * dt2;
+
+    p22 += qVel * dt2;
+    p33 += qVel * dt2;
+
+    lastTimestamp = timestamp;
+  }
+
+  void update(double latitude, double longitude, double accuracy, double speed, double heading) {
+    if (!initialized) return;
+    final r = accuracy * accuracy;
+
+    final yLat = latitude - lat;
+    final yLon = longitude - lon;
+
+    final sLat = p00 + r;
+    final kLat = sLat > 0 ? p00 / sLat : 0;
+
+    final sLon = p11 + r;
+    final kLon = sLon > 0 ? p11 / sLon : 0;
+
+    lat += kLat * yLat;
+    lon += kLon * yLon;
+
+    p00 = (1 - kLat) * p00;
+    p11 = (1 - kLon) * p11;
+
+      if (speed > 0.5 && heading >= 0) {
+          final hRad = heading * pi / 180.0;
+          final vxTarget = speed * sin(hRad);
+          final vyTarget = speed * cos(hRad);
+      const velGain = 0.3;
+      vLat += velGain * (vxTarget - vLat);
+      vLon += velGain * (vyTarget - vLon);
+    }
+  }
+
+  double getUncertainty() {
+    if (!initialized) return 10.0;
+    return sqrt((p00 + p11) / 2.0);
+  }
+
+  double getLatitude() => lat;
+  double getLongitude() => lon;
+}
+
+class SessionFatigue {
+  final List<DateTime> _alertTimestamps = [];
+  static const int maxAlertsPerWindow = 5;
+  static const Duration fatigueWindow = Duration(minutes: 1);
+  int _totalAlertsInRide = 0;
+
+  bool shouldSuppress(double alertConfidence) {
+    final now = DateTime.now();
+    _alertTimestamps.removeWhere((t) => now.difference(t) > fatigueWindow);
+    _alertTimestamps.add(now);
+    _totalAlertsInRide++;
+
+    if (_alertTimestamps.length > maxAlertsPerWindow) {
+      return alertConfidence < 0.7;
+    }
+    return false;
+  }
+
+  int get alertsInWindow => _alertTimestamps.length;
+  int get totalAlerts => _totalAlertsInRide;
+
+  void reset() {
+    _alertTimestamps.clear();
+    _totalAlertsInRide = 0;
+  }
+}
+
+enum SafetyMode { conservative, balanced, minimal }
+
+extension SafetyModeExtension on SafetyMode {
+  double get criticalThreshold {
+    switch (this) {
+      case SafetyMode.conservative: return 0.50;
+      case SafetyMode.balanced: return 0.70;
+      case SafetyMode.minimal: return 0.85;
+    }
+  }
+  double get highThreshold {
+    switch (this) {
+      case SafetyMode.conservative: return 0.30;
+      case SafetyMode.balanced: return 0.40;
+      case SafetyMode.minimal: return 0.60;
+    }
+  }
+  double get monitorThreshold {
+    switch (this) {
+      case SafetyMode.conservative: return 0.15;
+      case SafetyMode.balanced: return 0.20;
+      case SafetyMode.minimal: return 0.40;
+    }
+  }
+  String get label {
+    switch (this) {
+      case SafetyMode.conservative: return 'Conservative';
+      case SafetyMode.balanced: return 'Balanced';
+      case SafetyMode.minimal: return 'Minimal';
+    }
+  }
+}
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -72,6 +237,7 @@ class _HomePageState extends State<HomePage> {
 
   WebSocketChannel? _ws;
   Timer? _sendTimer;
+  Timer? _reconnectTimer;
 
   Map<String, dynamic>? user;
   bool isLoading = true;
@@ -86,12 +252,31 @@ class _HomePageState extends State<HomePage> {
   bool _showDataViewer = false;
   Map<String, dynamic>? _lastSentData;
 
+  // Sprint 1: Kalman filter
+  final KalmanFilter _kalman = KalmanFilter();
+
+  // Sprint 1: Time sync
+  double _timeOffset = 0.0;
+  double _timeSyncConfidence = 1.0;
+  final List<double> _timeOffsets = [];
+  int _lastClientSendTime = 0;
+
+  // Sprint 1: GPS accuracy tracking for outlier rejection
+  double _lastGpsAccuracy = 10.0;
+
   // Turn detection state (frontend only)
   Map<String, dynamic>?
   _turnInfo; // { exists, type, distance, intersectionLat, intersectionLng }
   DateTime? _lastTurnCheckTime;
   LatLng? _lastTurnCheckPosition;
   final TurnDebugInfo _turnDebug = TurnDebugInfo();
+
+  // Sprint 4: Session fatigue + safety mode
+  final SessionFatigue _fatigue = SessionFatigue();
+  SafetyMode _safetyMode = SafetyMode.balanced;
+
+  // Phase 1: Session recorder
+  final SessionRecorder _sessionRecorder = SessionRecorder();
 
   // Session recording
   bool _isRecording = false;
@@ -225,10 +410,47 @@ class _HomePageState extends State<HomePage> {
   }
 
   void _updatePosition(Position pos, {bool initial = false}) {
-    _currentPosition = LatLng(pos.latitude, pos.longitude);
+    _lastGpsAccuracy = pos.accuracy ?? 10.0;
+    final now = pos.timestamp ?? DateTime.now();
+    final nowMs = now.millisecondsSinceEpoch.toDouble();
 
-    // Set raw GPS as initial fused position; sensor fusion may modify it below
-    _fusedPosition = LatLng(pos.latitude, pos.longitude);
+    // Sprint 1: Kalman filter with outlier rejection
+    if (initial || !_kalman.initialized) {
+      _kalman.init(pos.latitude, pos.longitude, _lastGpsAccuracy, nowMs);
+      _fusedPosition = LatLng(pos.latitude, pos.longitude);
+      _currentPosition = LatLng(pos.latitude, pos.longitude);
+    } else {
+      // Predict step (run every time, even without gyro updates)
+      _kalman.predict(nowMs,
+        gyroZ: _lastGyro?.z ?? 0,
+        accelMagnitude: _lastAccel != null
+            ? (_lastAccel!.x.abs() + _lastAccel!.y.abs() + _lastAccel!.z.abs()) / 3
+            : 0,
+        speed: pos.speed ?? 0,
+      );
+
+      // Outlier rejection: if GPS jumped impossibly far, reject this update
+      final predictedLat = _kalman.getLatitude();
+      final predictedLon = _kalman.getLongitude();
+      final metersPerDegLat = 111320.0;
+      final cosLat = _cosDeg(pos.latitude);
+      final finalMetersPerDegLon = cosLat < 0.01 ? 111320.0 : 111320.0 * cosLat;
+      final predictedLatDelta = (predictedLat - pos.latitude) * metersPerDegLat;
+      final predictedLonDelta = (predictedLon - pos.longitude) * finalMetersPerDegLon;
+      final maxJumpM = (pos.speed ?? 0) * 4.0 + 30.0;
+
+      if ((predictedLatDelta.abs() > maxJumpM || predictedLonDelta.abs() > maxJumpM) && !initial) {
+        debugPrint('📍 Outlier rejected: dLat=${predictedLatDelta.toStringAsFixed(1)}m dLon=${predictedLonDelta.toStringAsFixed(1)}m maxJump=$maxJumpM');
+        // Still use dead reckoning for position
+        _fusedPosition = LatLng(predictedLat, predictedLon);
+      } else {
+        // Update Kalman with GPS measurement
+        _kalman.update(pos.latitude, pos.longitude, _lastGpsAccuracy, pos.speed ?? 0, pos.heading ?? 0);
+        _fusedPosition = LatLng(_kalman.getLatitude(), _kalman.getLongitude());
+      }
+    }
+
+    _currentPosition = LatLng(pos.latitude, pos.longitude);
 
     // Only auto-center the map during initial location fetch or if user hasn't interacted yet
     try {
@@ -250,17 +472,11 @@ class _HomePageState extends State<HomePage> {
       debugPrint('⚠️ Map not ready yet: $e');
     }
 
-    _lastTimestamp = pos.timestamp ?? DateTime.now();
+    _lastTimestamp = now;
     _lastSpeed = pos.speed;
     _lastHeading = pos.heading;
     _matchToRoad(pos.latitude, pos.longitude);
     _updateHeadingFromSources();
-
-    // FIX BUG #12: Sensor fusion enabled for Android/iOS
-    // Uses gyroscope + accelerometer + heading to augment GPS
-    if (_lastGyro != null) {
-      _applyFusion(pos);
-    }
 
     // Trigger a turn-check when position changes significantly (rate-limited)
     _maybeScheduleTurnCheck();
@@ -268,55 +484,37 @@ class _HomePageState extends State<HomePage> {
     setState(() {});
   }
 
-  // FIX BUG #12: Sensor fusion with gyroscope heading correction
-  void _applyFusion(Position gps) {
-    final now = gps.timestamp ?? DateTime.now();
-    if (_fusedPosition == null) {
-      _fusedPosition = LatLng(gps.latitude, gps.longitude);
-      _lastTimestamp = now;
-      return;
+  double _cosDeg(double degrees) {
+    return cos(degrees * pi / 180.0);
+  }
+
+  // Sprint 1: Sensor quality score (0.0–1.0)
+  double _computeSensorQuality() {
+    double score = 1.0;
+    if (_lastGpsAccuracy > 10) score *= 0.8;
+    if (_lastGpsAccuracy > 25) score *= 0.5;
+    if (_lastGpsAccuracy > 50) score *= 0.3;
+    if (_lastGyro == null) score *= 0.7;
+    if (!_hasCompassHeading) score *= 0.9;
+    if (_lastSpeed != null && _lastSpeed! < 0.5) score *= 0.95;
+    return score.clamp(0.1, 1.0);
+  }
+
+  // Sprint 1: Time sync update from server response
+  void _updateTimeOffset(int serverTimeMs) {
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    final rtt = nowMs - _lastClientSendTime;
+    if (rtt < 0 || rtt > 10000) return;
+    final estimatedOffset = ((serverTimeMs + rtt ~/ 2) - nowMs).toDouble();
+    _timeOffsets.add(estimatedOffset);
+    if (_timeOffsets.length > 20) _timeOffsets.removeAt(0);
+    if (_timeOffsets.length >= 3) {
+      final mean = _timeOffsets.reduce((a, b) => a + b) / _timeOffsets.length;
+      final variance = _timeOffsets.fold(0.0, (sum, v) => sum + (v - mean) * (v - mean)) / _timeOffsets.length;
+      final stdDev = sqrt(variance.abs());
+      _timeOffset = mean;
+      _timeSyncConfidence = (1.0 - (stdDev / 500).clamp(0.0, 0.9)).clamp(0.1, 1.0);
     }
-
-    double dt = _lastTimestamp != null
-        ? (now.difference(_lastTimestamp!).inMilliseconds / 1000.0)
-        : 0.0;
-    _lastTimestamp = now;
-
-    if (dt > 0.05 && dt < 5.0) { // Sanity check time delta
-      // Use gyroscope to adjust heading if available
-      double effectiveHeading = _lastHeading ?? 0;
-      if (_lastGyro != null && _lastGyro!.z.abs() > 0.1) {
-        // Gyro gives rad/s, convert to degrees
-        final gyroDeg = _lastGyro!.z * (180 / pi) * dt;
-        effectiveHeading = (effectiveHeading + gyroDeg) % 360;
-        if (effectiveHeading < 0) effectiveHeading += 360;
-      }
-
-      if (_lastSpeed != null && _lastSpeed! > 0.5 && effectiveHeading >= 0) {
-        double headingRad = effectiveHeading * pi / 180.0;
-        double dx = _lastSpeed! * dt * sin(headingRad);
-        double dy = _lastSpeed! * dt * cos(headingRad);
-        const metersPerDegLat = 111320.0;
-        final metersPerDegLon =
-            metersPerDegLat * cos(_fusedPosition!.latitude * pi / 180.0);
-        final dLat = dy / metersPerDegLat;
-        final dLon = dx / (metersPerDegLon == 0 ? 1 : metersPerDegLon);
-        LatLng deadReckon = LatLng(
-          _fusedPosition!.latitude + dLat,
-          _fusedPosition!.longitude + dLon,
-        );
-        // Complementary filter: trust GPS more at high speeds, dead reckoning more at low speeds
-        final alpha = _lastSpeed! > 5 ? 0.9 : 0.7;
-        double fusedLat =
-            alpha * gps.latitude + (1 - alpha) * deadReckon.latitude;
-        double fusedLon =
-            alpha * gps.longitude + (1 - alpha) * deadReckon.longitude;
-        _fusedPosition = LatLng(fusedLat, fusedLon);
-        return;
-      }
-    }
-    // Fallback to raw GPS
-    _fusedPosition = LatLng(gps.latitude, gps.longitude);
   }
 
   LatLng _projectOnSegment(LatLng p, LatLng a, LatLng b) {
@@ -351,7 +549,7 @@ class _HomePageState extends State<HomePage> {
   void _matchToRoad(double lat, double lon) {
     if (_cachedRoadData == null ||
         _cachedRoadDataTime == null ||
-        DateTime.now().difference(_cachedRoadDataTime!).inSeconds > 5) {
+        DateTime.now().difference(_cachedRoadDataTime!).inSeconds > 60) {
       _onRoad = false;
       _snappedPosition = null;
       _roadHeadingDeg = null;
@@ -560,6 +758,7 @@ class _HomePageState extends State<HomePage> {
 
           onDone: () {
             debugPrint('ℹ️ WebSocket closed - attempting to reconnect...');
+            if (!mounted) return;
             setState(() {
               _isConnected = false;
               _connectionStatus = 'Reconnecting...';
@@ -568,6 +767,7 @@ class _HomePageState extends State<HomePage> {
           },
           onError: (e) {
             debugPrint('❌ WebSocket error: $e - attempting to reconnect...');
+            if (!mounted) return;
             setState(() {
               _isConnected = false;
               _connectionStatus = 'Connection Error';
@@ -586,8 +786,11 @@ class _HomePageState extends State<HomePage> {
   }
 
   void _reconnectWebSocket() {
+    if (!mounted) return;
     _sendTimer?.cancel();
-    Timer(const Duration(seconds: 3), () {
+    _reconnectTimer?.cancel();
+    _reconnectTimer = Timer(const Duration(seconds: 3), () {
+      if (!mounted) return;
       debugPrint('🔄 Attempting to reconnect WebSocket...');
       _connectWebSocket();
     });
@@ -598,6 +801,18 @@ class _HomePageState extends State<HomePage> {
       final String text = msg is String ? msg : msg.toString();
       final dynamic payload = jsonDecode(text);
       if (payload is! Map) return;
+
+      // Sprint 1: Time sync from server response
+      if (payload['serverTime'] is int) {
+        _updateTimeOffset(payload['serverTime'] as int);
+      }
+
+      // Sprint 1: Extract map matching info from response
+      if (payload['mapMatch'] is Map) {
+        final mm = payload['mapMatch'] as Map;
+        // Server-snapped position is authoritative
+        debugPrint('🗺️ Server map match: road=${mm['roadId']} conf=${(mm['confidence'] * 100).toStringAsFixed(0)}%');
+      }
 
       // --- Format 1: Direct push from backend: {status: "threat", data: {...}} ---
       if (payload['status'] == 'threat' && payload['data'] != null) {
@@ -672,6 +887,18 @@ class _HomePageState extends State<HomePage> {
             _currentRoadInfo = payload['currentRoadInfo'] as Map<String, dynamic>?;
           });
         }
+
+        // Phase 1: Record exchange for session replay
+        if (_sessionRecorder.isRecording && _lastSentData != null && payload is Map) {
+          _sessionRecorder.recordExchange(
+            sentPayload: _lastSentData!,
+            serverResponse: payload.cast<String, dynamic>(),
+            roundTripMs: (DateTime.now().millisecondsSinceEpoch - _lastClientSendTime).toDouble(),
+            batteryPct: 100,
+            networkType: _connectivityStatus.toString(),
+            gpsAccuracy: _lastGpsAccuracy,
+          );
+        }
       }
     } catch (e) {
       debugPrint('❌ Failed to parse WebSocket message: $e');
@@ -686,47 +913,73 @@ class _HomePageState extends State<HomePage> {
     final String type = threat['type'] ?? 'unknown';
     final String message = threat['message'] ?? '⚠️ Collision risk detected';
     final int severity = threat['severity'] ?? 1;
+    final String alertClass = threat['alertClass'] as String? ?? (severity >= 3 ? 'critical' : severity >= 2 ? 'high' : 'monitor');
+    final double alertConfidence = (threat['alertConfidence'] as num?)?.toDouble() ?? (threat['collisionProbability'] as num?)?.toDouble() ?? 0;
+
+    // Sprint 4: Session fatigue check
+    if (_fatigue.shouldSuppress(alertConfidence)) {
+      debugPrint('🔇 Alert suppressed by session fatigue (${_fatigue.alertsInWindow} in 60s)');
+      return;
+    }
+
+    // Sprint 4: Safety mode filtering
+    final String effectiveClass = _classifyWithMode(alertConfidence, _safetyMode);
+    if (effectiveClass == 'ignore') {
+      debugPrint('🔇 Alert suppressed by safety mode ($_safetyMode, conf=$alertConfidence)');
+      return;
+    }
 
     IconData icon;
     Color color;
-    switch (type) {
-      case 'turn_collision':
-        icon = Icons.turn_slight_right;
-        color = Colors.red;
+    String classLabel;
+    switch (effectiveClass) {
+      case 'critical':
+        icon = Icons.warning;
+        color = Colors.red.shade700;
+        classLabel = 'CRITICAL';
         break;
-      case 'predicted_collision':
-        icon = Icons.directions_car;
-        color = Colors.red;
-        break;
-      case 'rear_end':
-        icon = Icons.car_crash;
+      case 'high':
+        icon = Icons.warning_amber_rounded;
         color = Colors.deepOrange;
+        classLabel = 'HIGH';
         break;
-      case 'wrong_direction':
-        icon = Icons.swap_horiz;
-        color = Colors.purple;
+      case 'monitor':
+        icon = Icons.info_outline;
+        color = Colors.orange.shade700;
+        classLabel = 'MONITOR';
         break;
       default:
-        icon = Icons.warning;
-        color = Colors.orange;
+        icon = Icons.info_outline;
+        color = Colors.grey;
+        classLabel = 'INFO';
     }
 
-    // Trigger vibration (SOS pattern for severity 3)
-    HapticFeedback.heavyImpact();
-    if (severity >= 2) {
+    // Haptic feedback based on alert class
+    if (effectiveClass == 'critical') {
       HapticFeedback.heavyImpact();
-      Future.delayed(const Duration(milliseconds: 200), () {
-        HapticFeedback.heavyImpact();
-      });
+      Future.delayed(const Duration(milliseconds: 200), () { HapticFeedback.heavyImpact(); });
+      Future.delayed(const Duration(milliseconds: 400), () { HapticFeedback.heavyImpact(); });
+      SystemSound.play(SystemSoundType.alert);
+    } else if (effectiveClass == 'high') {
+      HapticFeedback.heavyImpact();
+      SystemSound.play(SystemSoundType.alert);
+    } else {
+      HapticFeedback.lightImpact();
     }
-
-    // Play system alert sound
-    SystemSound.play(SystemSoundType.alert);
 
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Row(
           children: [
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+              decoration: BoxDecoration(
+                color: Colors.white.withOpacity(0.2),
+                borderRadius: BorderRadius.circular(4),
+              ),
+              child: Text(classLabel, style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.white)),
+            ),
+            const SizedBox(width: 8),
             Icon(icon, color: Colors.white, size: 20),
             const SizedBox(width: 10),
             Expanded(
@@ -735,8 +988,8 @@ class _HomePageState extends State<HomePage> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(message, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold)),
-                  if (severity > 0)
-                    Text('Severity: $severity/3', style: const TextStyle(fontSize: 12)),
+                  if (alertConfidence > 0)
+                    Text('${(alertConfidence * 100).toStringAsFixed(0)}% confidence', style: const TextStyle(fontSize: 11)),
                 ],
               ),
             ),
@@ -749,6 +1002,14 @@ class _HomePageState extends State<HomePage> {
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
       ),
     );
+  }
+
+  /// Classify alert based on confidence and safety mode
+  String _classifyWithMode(double confidence, SafetyMode mode) {
+    if (confidence >= mode.criticalThreshold) return 'critical';
+    if (confidence >= mode.highThreshold) return 'high';
+    if (confidence >= mode.monitorThreshold) return 'monitor';
+    return 'ignore';
   }
 
   void _sendWebSocket() {
@@ -771,10 +1032,17 @@ class _HomePageState extends State<HomePage> {
 
     // WebSocket connection will be checked in the try-catch block below
 
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    _lastClientSendTime = nowMs;
+
+    // Prefer snapped position when on road (more accurate)
+    final effectiveLat = (_onRoad && _snappedPosition != null) ? _snappedPosition!.latitude : _fusedPosition!.latitude;
+    final effectiveLng = (_onRoad && _snappedPosition != null) ? _snappedPosition!.longitude : _fusedPosition!.longitude;
+
     final payload = {
       "userId": user!['_id'],
-      "latitude": _fusedPosition!.latitude,
-      "longitude": _fusedPosition!.longitude,
+      "latitude": effectiveLat,
+      "longitude": effectiveLng,
       "speed": _lastSpeed,
       "heading": _lastHeading,
       "accel": _lastAccel != null
@@ -793,6 +1061,13 @@ class _HomePageState extends State<HomePage> {
       "turnDistance": _turnInfo?['distance'],
       "intersectionLat": _turnInfo?['intersectionLat'],
       "intersectionLng": _turnInfo?['intersectionLng'],
+      // Sprint 1: New fields
+      "positionUncertainty": _kalman.initialized ? _kalman.getUncertainty() : 10.0,
+      "sensorQuality": _computeSensorQuality(),
+      "clientTime": nowMs,
+      "serverTime": nowMs + _timeOffset.round(),
+      "timeSyncConfidence": _timeSyncConfidence,
+      "gpsAccuracy": _lastGpsAccuracy,
     };
 
     debugPrint("📤 Sending WebSocket data...");
@@ -856,6 +1131,7 @@ class _HomePageState extends State<HomePage> {
     _sessionStartTime = DateTime.now();
     _recordingSeconds = 0;
     _isRecording = true;
+    _sessionRecorder.startRide();
     _recordingTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (mounted) setState(() => _recordingSeconds++);
     });
@@ -866,33 +1142,88 @@ class _HomePageState extends State<HomePage> {
     _isRecording = false;
     _recordingTimer?.cancel();
     _recordingTimer = null;
-    final session = {
-      'app': 'Safety App',
-      'version': '1.0.0',
-      'session': {
-        'startTime': _sessionStartTime?.toIso8601String(),
-        'endTime': DateTime.now().toIso8601String(),
-        'durationSec': _recordingSeconds,
-        'snapshotCount': _sessionSnapshots.length,
-      },
-      'snapshots': _sessionSnapshots,
-    };
-    try {
-      final dir = await getApplicationDocumentsDirectory();
-      final sessionsDir = Directory('${dir.path}/debug_sessions');
-      if (!await sessionsDir.exists()) await sessionsDir.create();
-      final fileName = 'safety_session_${DateTime.now().millisecondsSinceEpoch}.json';
-      final file = File('${sessionsDir.path}/$fileName');
-      await file.writeAsString(const JsonEncoder.withIndent('  ').convert(session));
-      debugPrint('📁 Session saved: ${file.path}');
-      await Share.shareXFiles(
-        [XFile(file.path)],
-        subject: 'Safety App Debug Session',
-      );
-    } catch (e) {
-      debugPrint('❌ Failed to save/share session: $e');
+
+    // Phase 1: Show ride outcome dialog
+    Map<String, dynamic>? outcome;
+    if (mounted) {
+      outcome = await _showRideOutcomeDialog();
     }
-    if (mounted) setState(() {});
+
+    await _sessionRecorder.stopRide(outcome: outcome);
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Ride saved. Share from Profile page.')),
+      );
+      setState(() {});
+    }
+  }
+
+  Future<Map<String, dynamic>> _showRideOutcomeDialog() async {
+    bool nearMiss = false;
+    int falseAlerts = 0;
+    String? issue;
+    final completer = Completer<Map<String, dynamic>>();
+
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            return AlertDialog(
+              title: const Text('Ride Complete'),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Duration: $_recordingSeconds s'),
+                  Text('Snapshots: ${_sessionRecorder.snapshotCount}'),
+                  const SizedBox(height: 16),
+                  const Text('Any issues during this ride?'),
+                  const SizedBox(height: 8),
+                  CheckboxListTile(
+                    title: const Text('Near miss (almost collided)'),
+                    value: nearMiss,
+                    onChanged: (v) => setDialogState(() => nearMiss = v ?? false),
+                    dense: true,
+                  ),
+                  CheckboxListTile(
+                    title: const Text('False alert (unnecessary warning)'),
+                    value: falseAlerts > 0,
+                    onChanged: (v) => setDialogState(() => falseAlerts = v == true ? (falseAlerts + 1) : 0),
+                    dense: true,
+                  ),
+                  TextField(
+                    decoration: const InputDecoration(
+                      labelText: 'Other issues (optional)',
+                      border: OutlineInputBorder(),
+                    ),
+                    onChanged: (v) => issue = v,
+                    maxLines: 2,
+                  ),
+                ],
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () {
+                    completer.complete({
+                      'userReportedNearMiss': nearMiss,
+                      'userReportedFalseAlert': falseAlerts,
+                      'userReportedIssue': issue?.isNotEmpty == true ? issue : null,
+                    });
+                    Navigator.pop(ctx);
+                  },
+                  child: const Text('Submit'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+
+    return completer.future;
   }
 
   void _captureSnapshot() {
@@ -1033,6 +1364,7 @@ class _HomePageState extends State<HomePage> {
     _connectivityStream?.cancel();
     _sendTimer?.cancel();
     _clearThreatTimer?.cancel();
+    _reconnectTimer?.cancel();
     _ws?.sink.close();
     super.dispose();
   }
@@ -1780,12 +2112,57 @@ class _HomePageState extends State<HomePage> {
                               ],
                             ),
                           ),
+                          const SizedBox(width: 6),
+                          // Sprint 4: Safety mode toggle
+                          GestureDetector(
+                            onTap: () {
+                              final modes = SafetyMode.values;
+                              final idx = (modes.indexOf(_safetyMode) + 1) % modes.length;
+                              setState(() => _safetyMode = modes[idx]);
+                              _fatigue.reset();
+                              debugPrint('🛡️ Safety mode: ${_safetyMode.label}');
+                            },
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                              decoration: BoxDecoration(
+                                color: _safetyMode == SafetyMode.conservative
+                                    ? Colors.green.withOpacity(0.8)
+                                    : _safetyMode == SafetyMode.balanced
+                                        ? Colors.blue.withOpacity(0.8)
+                                        : Colors.red.withOpacity(0.8),
+                                borderRadius: BorderRadius.circular(12),
+                              ),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(
+                                    _safetyMode == SafetyMode.conservative
+                                        ? Icons.shield
+                                        : _safetyMode == SafetyMode.balanced
+                                            ? Icons.shield_outlined
+                                            : Icons.flash_on,
+                                    color: Colors.white,
+                                    size: 14,
+                                  ),
+                                  const SizedBox(width: 4),
+                                  Text(
+                                    _safetyMode.label,
+                                    style: const TextStyle(
+                                      color: Colors.white,
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.w500,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ),
                         ],
                       ),
                     ),
                   ),
                 ),
-                // Active threat banners (above map)
+                // Active threat banners (above map) — Sprint 4: alert class based
                 if (_activeThreats.isNotEmpty)
                   Positioned(
                     top: 76,
@@ -1793,30 +2170,28 @@ class _HomePageState extends State<HomePage> {
                     right: 8,
                     child: Column(
                       children: _activeThreats.map((t) {
-                        final type = t['type'] ?? 'unknown';
+                        final String alertClass = t['alertClass'] as String? ?? (t['severity'] ?? 1) >= 3 ? 'critical' : 'high';
                         final msg = t['message'] ?? 'Collision risk';
+                        final double conf = (t['alertConfidence'] as num?)?.toDouble() ?? 0;
+
                         Color bgColor;
                         IconData icon;
-                        switch (type) {
-                          case 'turn_collision':
+                        switch (alertClass) {
+                          case 'critical':
                             bgColor = Colors.red.shade700;
-                            icon = Icons.turn_slight_right;
+                            icon = Icons.warning;
                             break;
-                          case 'predicted_collision':
-                            bgColor = Colors.red.shade700;
-                            icon = Icons.directions_car;
-                            break;
-                          case 'rear_end':
+                          case 'high':
                             bgColor = Colors.deepOrange;
-                            icon = Icons.car_crash;
+                            icon = Icons.warning_amber_rounded;
                             break;
-                          case 'wrong_direction':
-                            bgColor = Colors.purple;
-                            icon = Icons.swap_horiz;
+                          case 'monitor':
+                            bgColor = Colors.orange.shade700;
+                            icon = Icons.info_outline;
                             break;
                           default:
-                            bgColor = Colors.orange.shade800;
-                            icon = Icons.warning;
+                            bgColor = Colors.grey.shade700;
+                            icon = Icons.info;
                         }
                         return Container(
                           margin: const EdgeInsets.only(bottom: 4),
@@ -1831,9 +2206,15 @@ class _HomePageState extends State<HomePage> {
                               Icon(icon, color: Colors.white, size: 18),
                               const SizedBox(width: 8),
                               Expanded(
-                                child: Text(
-                                  msg,
-                                  style: const TextStyle(color: Colors.white, fontSize: 13),
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Text(msg, style: const TextStyle(color: Colors.white, fontSize: 13)),
+                                    if (conf > 0)
+                                      Text('${(conf * 100).toStringAsFixed(0)}% | $alertClass',
+                                        style: const TextStyle(color: Colors.white70, fontSize: 10)),
+                                  ],
                                 ),
                               ),
                             ],
