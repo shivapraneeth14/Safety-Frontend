@@ -214,6 +214,9 @@ class _HomePageState extends State<HomePage> {
 
   // Threat markers rendered as red dots
   List<Marker> _threatMarkers = [];
+  // Turn debug markers
+  List<Marker> _turnDetectionMarkers = [];
+  LatLng? _turnDetectedAt;
   // Active threats for banners
   List<Map<String, dynamic>> _activeThreats = [];
   Timer? _clearThreatTimer;
@@ -515,6 +518,49 @@ class _HomePageState extends State<HomePage> {
       _timeOffset = mean;
       _timeSyncConfidence = (1.0 - (stdDev / 500).clamp(0.0, 0.9)).clamp(0.1, 1.0);
     }
+  }
+
+  List<Marker> _buildTurnMarkers(Map<String, dynamic>? turnInfo) {
+    if (turnInfo == null || turnInfo['exists'] != true) return [];
+    final markers = <Marker>[];
+    final type = turnInfo['type'] as String? ?? '?';
+    final dist = turnInfo['distance'] as double? ?? 0;
+
+    if (_turnDetectedAt != null) {
+      markers.add(Marker(
+        point: _turnDetectedAt!,
+        width: 20, height: 20,
+        child: Container(
+          decoration: BoxDecoration(
+            color: Colors.yellow, shape: BoxShape.circle,
+            border: Border.all(color: Colors.black, width: 2),
+          ),
+          child: const Center(child: Text('D', style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.black))),
+        ),
+      ));
+    }
+
+    final lat = turnInfo['intersectionLat'] as double?;
+    final lng = turnInfo['intersectionLng'] as double?;
+    if (lat != null && lng != null) {
+      markers.add(Marker(
+        point: LatLng(lat, lng),
+        width: 56, height: 28,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+          decoration: BoxDecoration(
+            color: Colors.red.shade800,
+            borderRadius: BorderRadius.circular(6),
+            border: Border.all(color: Colors.white, width: 1),
+          ),
+          child: Text('${type.toUpperCase()} ${dist.toInt()}m',
+            style: const TextStyle(color: Colors.white, fontSize: 9, fontWeight: FontWeight.bold),
+          ),
+        ),
+      ));
+    }
+
+    return markers;
   }
 
   LatLng _projectOnSegment(LatLng p, LatLng a, LatLng b) {
@@ -1930,6 +1976,12 @@ class _HomePageState extends State<HomePage> {
       if (mounted) {
         setState(() {
           _turnInfo = result ?? {"exists": false, "distance": null};
+          if (result != null && result['exists'] == true && _turnDetectedAt == null) {
+            _turnDetectedAt = _fusedPosition;
+          } else if (result == null || result['exists'] != true) {
+            _turnDetectedAt = null;
+          }
+          _turnDetectionMarkers = _buildTurnMarkers(result);
         });
       }
     } catch (e) {
@@ -2271,6 +2323,9 @@ class _HomePageState extends State<HomePage> {
                       // Threat markers layer (red dots)
                       if (_threatMarkers.isNotEmpty)
                         MarkerLayer(markers: _threatMarkers),
+                      // Turn debug markers (yellow detection dot + red intersection label)
+                      if (_turnDetectionMarkers.isNotEmpty)
+                        MarkerLayer(markers: _turnDetectionMarkers),
                     ],
                   ),
                 ),
