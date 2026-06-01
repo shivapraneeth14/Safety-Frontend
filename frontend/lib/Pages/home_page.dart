@@ -525,6 +525,10 @@ class _HomePageState extends State<HomePage> {
     final markers = <Marker>[];
     final type = turnInfo['type'] as String? ?? '?';
     final dist = turnInfo['distance'] as double? ?? 0;
+    final dirs = turnInfo['directions'] as List? ?? [];
+    final label = dirs.isNotEmpty
+        ? dirs.join('/')
+        : type;
 
     if (_turnDetectedAt != null) {
       markers.add(Marker(
@@ -553,7 +557,7 @@ class _HomePageState extends State<HomePage> {
             borderRadius: BorderRadius.circular(6),
             border: Border.all(color: Colors.white, width: 1),
           ),
-          child: Text('${type.toUpperCase()} ${dist.toInt()}m',
+          child: Text('${label.toUpperCase()} ${dist.toInt()}m',
             style: const TextStyle(color: Colors.white, fontSize: 9, fontWeight: FontWeight.bold),
           ),
         ),
@@ -1799,6 +1803,7 @@ class _HomePageState extends State<HomePage> {
           "distance": dist,
           "intersectionLat": points[j].latitude,
           "intersectionLng": points[j].longitude,
+          "directions": dirs.toList(),
         };
         _turnDebug.detectResult = result;
         return result;
