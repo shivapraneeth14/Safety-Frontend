@@ -268,8 +268,8 @@ class _HomePageState extends State<HomePage> {
   double _lastGpsAccuracy = 10.0;
 
   // Turn detection state (frontend only)
-  Map<String, dynamic>?
-  _turnInfo; // { exists, type, distance, intersectionLat, intersectionLng }
+  List<Map<String, dynamic>> _detectedTurns = []; // list of turns, sorted by distance
+  Map<String, dynamic>? _primaryTurn;              // nearest turn (for backward compat)
   DateTime? _lastTurnCheckTime;
   LatLng? _lastTurnCheckPosition;
   final TurnDebugInfo _turnDebug = TurnDebugInfo();
@@ -520,15 +520,8 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  List<Marker> _buildTurnMarkers(Map<String, dynamic>? turnInfo) {
-    if (turnInfo == null || turnInfo['exists'] != true) return [];
+  List<Marker> _buildTurnMarkers(Map<String, dynamic>? primaryTurn) {
     final markers = <Marker>[];
-    final type = turnInfo['type'] as String? ?? '?';
-    final dist = turnInfo['distance'] as double? ?? 0;
-    final dirs = turnInfo['directions'] as List? ?? [];
-    final label = dirs.isNotEmpty
-        ? dirs.join('/')
-        : type;
 
     if (_turnDetectedAt != null) {
       markers.add(Marker(
@@ -544,21 +537,35 @@ class _HomePageState extends State<HomePage> {
       ));
     }
 
-    final lat = turnInfo['intersectionLat'] as double?;
-    final lng = turnInfo['intersectionLng'] as double?;
-    if (lat != null && lng != null) {
+    // FIX BUG 3: Markers for ALL detected turns
+    for (int i = 0; i < _detectedTurns.length; i++) {
+      final turn = _detectedTurns[i];
+      if (turn['exists'] != true) continue;
+      final lat = turn['intersectionLat'] as double?;
+      final lng = turn['intersectionLng'] as double?;
+      if (lat == null || lng == null) continue;
+      final type = turn['type'] as String? ?? '?';
+      final dist = (turn['distance'] as double?)?.toInt() ?? 0;
+      final isPrimary = i == 0;
+
       markers.add(Marker(
         point: LatLng(lat, lng),
-        width: 56, height: 28,
+        width: isPrimary ? 56 : 44,
+        height: isPrimary ? 28 : 24,
         child: Container(
           padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
           decoration: BoxDecoration(
-            color: Colors.red.shade800,
+            color: isPrimary ? Colors.red.shade800 : Colors.orange.shade700,
             borderRadius: BorderRadius.circular(6),
-            border: Border.all(color: Colors.white, width: 1),
+            border: Border.all(color: Colors.white, width: isPrimary ? 1 : 0.5),
           ),
-          child: Text('${label.toUpperCase()} ${dist.toInt()}m',
-            style: const TextStyle(color: Colors.white, fontSize: 9, fontWeight: FontWeight.bold),
+          child: Text(
+            '${type.toUpperCase()} ${dist}m',
+            style: TextStyle(
+              color: Colors.white,
+              fontSize: isPrimary ? 9 : 8,
+              fontWeight: isPrimary ? FontWeight.bold : FontWeight.normal,
+            ),
           ),
         ),
       ));
@@ -937,18 +944,18 @@ class _HomePageState extends State<HomePage> {
             _currentRoadInfo = payload['currentRoadInfo'] as Map<String, dynamic>?;
           });
         }
+      }
 
-        // Phase 1: Record exchange for session replay
-        if (_sessionRecorder.isRecording && _lastSentData != null && payload is Map) {
-          _sessionRecorder.recordExchange(
-            sentPayload: _lastSentData!,
-            serverResponse: payload.cast<String, dynamic>(),
-            roundTripMs: (DateTime.now().millisecondsSinceEpoch - _lastClientSendTime).toDouble(),
-            batteryPct: 100,
-            networkType: _connectivityStatus.toString(),
-            gpsAccuracy: _lastGpsAccuracy,
-          );
-        }
+      // Record every WebSocket exchange for session replay
+      if (_sessionRecorder.isRecording && _lastSentData != null && payload is Map) {
+        _sessionRecorder.recordExchange(
+          sentPayload: _lastSentData!,
+          serverResponse: payload.cast<String, dynamic>(),
+          roundTripMs: (DateTime.now().millisecondsSinceEpoch - _lastClientSendTime).toDouble(),
+          batteryPct: 100,
+          networkType: _connectivityStatus.toString(),
+          gpsAccuracy: _lastGpsAccuracy,
+        );
       }
     } catch (e) {
       debugPrint('❌ Failed to parse WebSocket message: $e');
@@ -1106,11 +1113,19 @@ class _HomePageState extends State<HomePage> {
           : null,
       "connectivity": _connectivityStatus.toString(),
       "timestamp": DateTime.now().toIso8601String(),
-      "turnAhead": _turnInfo?['exists'] ?? false,
-      "turnType": _turnInfo?['type'],
-      "turnDistance": _turnInfo?['distance'],
-      "intersectionLat": _turnInfo?['intersectionLat'],
-      "intersectionLng": _turnInfo?['intersectionLng'],
+      "turnAhead": _detectedTurns.isNotEmpty,
+      "turns": _detectedTurns.map((t) => {
+        "type": t['type'],
+        "distance": (t['distance'] as double).round(),
+        "angle": (t['angle'] as num?)?.round(),
+        "lat": t['intersectionLat'],
+        "lng": t['intersectionLng'],
+        "riskLevel": t['riskLevel'] ?? 1,
+      }).toList(),
+      "turnType": _primaryTurn?['type'],
+      "turnDistance": _primaryTurn?['distance'],
+      "intersectionLat": _primaryTurn?['intersectionLat'],
+      "intersectionLng": _primaryTurn?['intersectionLng'],
       // Sprint 1: New fields
       "positionUncertainty": _kalman.initialized ? _kalman.getUncertainty() : 10.0,
       "sensorQuality": _computeSensorQuality(),
@@ -1288,7 +1303,7 @@ class _HomePageState extends State<HomePage> {
       headingSource: _headingSourceName,
       activeThreats: List.from(_activeThreats),
       upcomingTurns: List.from(_upcomingTurns),
-      turnInfo: _turnInfo,
+      turnInfo: _primaryTurn,
       elapsedSec: elapsed,
     );
     _sessionSnapshots.add(snapshot);
@@ -1297,10 +1312,10 @@ class _HomePageState extends State<HomePage> {
   Future<List<File>> _getRecordingFiles() async {
     try {
       final dir = await getApplicationDocumentsDirectory();
-      final sessionsDir = Directory('${dir.path}/debug_sessions');
+      final sessionsDir = Directory('${dir.path}/sessions');
       if (!await sessionsDir.exists()) return [];
       final files = await sessionsDir.list().where(
-        (f) => f is File && f.path.endsWith('.json') && f.path.contains('safety_session_'),
+        (f) => f is File && f.path.endsWith('.json') && f.path.contains('ride_'),
       ).cast<File>().toList();
       files.sort((a, b) => b.lastModifiedSync().compareTo(a.lastModifiedSync()));
       return files;
@@ -1521,7 +1536,7 @@ class _HomePageState extends State<HomePage> {
   // Cache position for road data fetch-distance check
   LatLng? _lastRoadFetchPosition;
 
-  Future<Map<String, dynamic>?> _detectTurnAhead() async {
+  Future<List<Map<String, dynamic>>> _detectTurnAhead() async {
     if (_fusedPosition == null) {
       _turnDebug.cacheTooOld = null;
       _turnDebug.usingCache = null;
@@ -1529,7 +1544,7 @@ class _HomePageState extends State<HomePage> {
       _turnDebug.httpError = null;
       _turnDebug.roadsReturned = null;
       _turnDebug.fallbackUsed = null;
-      return null;
+      return [];
     }
 
     final lat = _fusedPosition!.latitude;
@@ -1537,7 +1552,6 @@ class _HomePageState extends State<HomePage> {
     final scanRadius = _getScanRadius();
     _turnDebug.scanRadius = scanRadius;
 
-    // FIX BUG #36: Use cached road data if within 20m of last fetch
     if (_cachedRoadData != null && _lastRoadFetchPosition != null && _cachedRoadData!.isNotEmpty) {
       final distSinceFetch = _distance(
         lat, lon,
@@ -1589,7 +1603,7 @@ class _HomePageState extends State<HomePage> {
         debugPrint('🗺️ Falling back to cached road data');
         return _processTurnDataFromElements(_cachedRoadData!, lat, lon, scanRadius);
       }
-      return null;
+      return [];
     }
 
     if (data != null && data['elements'] != null && (data['elements'] as List).isNotEmpty) {
@@ -1605,14 +1619,82 @@ class _HomePageState extends State<HomePage> {
       debugPrint('🗺️ Falling back to cached road data');
       return _processTurnDataFromElements(_cachedRoadData!, lat, lon, scanRadius);
     }
-    return null;
+    return [];
   }
 
-  Future<Map<String, dynamic>?> _processTurnDataFromElements(List<dynamic> elements, double lat, double lon, double scanRadius) async {
+  // FIX BUG 4: Deduplicate junctions within 15m
+  List<Map<String, dynamic>> _deduplicateJunctions(List<Map<String, dynamic>> junctions) {
+    final merged = <Map<String, dynamic>>[];
+    for (final j in junctions) {
+      final lat = j['intersectionLat'] as double;
+      final lng = j['intersectionLng'] as double;
+      final existing = merged.indexWhere((m) {
+        final mLat = m['intersectionLat'] as double;
+        final mLng = m['intersectionLng'] as double;
+        return _distance(lat, lng, mLat, mLng) < 15.0;
+      });
+      if (existing >= 0) {
+        final existingDist = merged[existing]['distance'] as double;
+        if ((j['distance'] as double) < existingDist) {
+          merged[existing] = j;
+        }
+        final dirs = {
+          ...(merged[existing]['directions'] as List).cast<String>(),
+          ...(j['directions'] as List).cast<String>(),
+        };
+        merged[existing]['directions'] = dirs.toList();
+        final roads = {
+          ...(merged[existing]['roads'] as List).cast<int>(),
+          ...(j['roads'] as List).cast<int>(),
+        };
+        merged[existing]['roads'] = roads.toList();
+        if (j['type'] == 'cross' || j['type'] == 't_junction') {
+          merged[existing]['type'] = j['type'];
+        }
+      } else {
+        merged.add(Map<String, dynamic>.from(j));
+      }
+    }
+    return merged;
+  }
+
+  // FIX BUG 6: Check if a point is within a forward-facing cone
+  bool _isInCone(double originLat, double originLng, double headingDeg,
+      double targetLat, double targetLng, double coneAngleDeg, double maxRangeM) {
+    final dist = _distance(originLat, originLng, targetLat, targetLng);
+    if (dist > maxRangeM || dist < 1) return false;
+    final bearing = _bearing(LatLng(originLat, originLng), LatLng(targetLat, targetLng));
+    double diff = (bearing - headingDeg) % 360;
+    if (diff > 180) diff -= 360;
+    return diff.abs() <= coneAngleDeg / 2;
+  }
+
+  Future<List<Map<String, dynamic>>> _processTurnDataFromElements(
+      List<dynamic> elements, double lat, double lon, double scanRadius) async {
     _turnDebug.phase1Entries.clear();
     _turnDebug.phase2Entries.clear();
     _turnDebug.elementsCount = elements.length;
 
+    if (elements.isEmpty) return [];
+
+    // ─── Build node-to-ways map from ALL elements ───
+    final Map<int, List<int>> nodeToWays = {};
+    final Map<int, List> otherGeoms = {};
+    for (final el in elements) {
+      if (el['type'] != 'way' || el['nodes'] == null) continue;
+      final wId = el['id'] as int;
+      for (final nid in (el['nodes'] as List).cast<int>()) {
+        nodeToWays.putIfAbsent(nid, () => []).add(wId);
+      }
+      if (el['geometry'] != null) {
+        otherGeoms[wId] = el['geometry'] as List;
+      }
+    }
+
+    _turnDebug.nodeToWaysCount = nodeToWays.length;
+    _turnDebug.waysCount = elements.where((e) => e['type'] == 'way').length;
+
+    // ─── Find closest road to vehicle ───
     dynamic bestWay;
     int bestSegmentIndex = 0;
     double bestSegmentDist = double.infinity;
@@ -1621,113 +1703,107 @@ class _HomePageState extends State<HomePage> {
       if (el['geometry'] == null) continue;
       final geom = el['geometry'] as List<dynamic>;
       if (geom.length < 2) continue;
-
-      final points = geom
+      final pts = geom
           .map((p) => LatLng(p['lat'] as double, p['lon'] as double))
           .toList();
-
-      for (int i = 0; i < points.length - 1; i++) {
-        final p1 = points[i];
-        final p2 = points[i + 1];
-        final distToSegment = _distanceToSegment(lat, lon, p1, p2);
-        if (distToSegment < bestSegmentDist) {
-          bestSegmentDist = distToSegment;
+      for (int i = 0; i < pts.length - 1; i++) {
+        final d = _distanceToSegment(lat, lon, pts[i], pts[i + 1]);
+        if (d < bestSegmentDist) {
+          bestSegmentDist = d;
           bestWay = el;
           bestSegmentIndex = i;
         }
       }
     }
 
-    if (bestWay == null) {
-      _turnDebug.bestWayId = 'null';
-      debugPrint('⚠️ No suitable way found');
-      _turnDebug.detectResult = {'error': 'No suitable way found'};
-      return null;
-    }
-
-    _turnDebug.bestWayId = bestWay['id']?.toString();
-    _turnDebug.bestWayHighway = bestWay['highway']?.toString();
-    _turnDebug.bestWayName = bestWay['name']?.toString();
+    _turnDebug.bestWayId = bestWay?['id']?.toString();
+    _turnDebug.bestWayHighway = bestWay?['highway']?.toString();
+    _turnDebug.bestWayName = bestWay?['name']?.toString();
     _turnDebug.bestSegmentDist = bestSegmentDist;
     _turnDebug.bestSegmentIndex = bestSegmentIndex;
 
-    final geom = bestWay['geometry'] as List<dynamic>;
-    if (geom.length < 2) {
-      _turnDebug.detectResult = {'error': 'Geometry too short'};
-      return null;
+    if (bestWay == null) {
+      _turnDebug.bestWayId = 'null';
+      _turnDebug.detectResult = {"exists": false, "distance": null};
+      return [];
     }
 
-    final points = geom
-        .map((p) => LatLng(p['lat'] as double, p['lon'] as double))
-        .toList();
+    // ─── FIX BUG 1: Scan ALL roads for junctions ───
+    final List<Map<String, dynamic>> allJunctions = [];
 
-    final nodes = bestWay['nodes'] as List?;
-    int startIndex = bestSegmentIndex;
+    for (final el in elements) {
+      if (el['geometry'] == null) continue;
+      final geom = el['geometry'] as List<dynamic>;
+      if (geom.length < 2) continue;
+      final nodes = el['nodes'] as List?;
+      if (nodes == null || nodes.isEmpty) continue;
 
-    final segBearing = _bearing(points[startIndex], points[startIndex + 1]);
-    double headingDiff = (_lastHeading ?? segBearing) - segBearing;
-    if (headingDiff > 180) headingDiff -= 360;
-    if (headingDiff < -180) headingDiff += 360;
-    final goingForward = headingDiff.abs() <= 90;
-    _turnDebug.goingForward = goingForward;
-    _turnDebug.totalPoints = points.length;
+      final roadId = el['id'] as int;
+      final pts = geom
+          .map((p) => LatLng(p['lat'] as double, p['lon'] as double))
+          .toList();
 
-    // ─── PHASE 1: Junction detection ───
-    if (nodes != null && nodes.isNotEmpty) {
-      _turnDebug.phase1Executed = true;
-      _turnDebug.hasNodes = true;
-      _turnDebug.nodeCount = nodes.length;
-
-      final Map<int, List<int>> nodeToWays = {};
-      final bestWayId = bestWay['id'] as int;
-      for (final el in elements) {
-        if (el['type'] != 'way' || el['nodes'] == null) continue;
-        final wId = el['id'] as int;
-        for (final nid in (el['nodes'] as List).cast<int>()) {
-          nodeToWays.putIfAbsent(nid, () => []).add(wId);
-        }
+      double minSegDist = double.infinity;
+      int segIdx = 0;
+      for (int i = 0; i < pts.length - 1; i++) {
+        final d = _distanceToSegment(lat, lon, pts[i], pts[i + 1]);
+        if (d < minSegDist) { minSegDist = d; segIdx = i; }
       }
+      if (minSegDist > 50) continue;
 
-      final Map<int, List> otherGeoms = {};
-      for (final el in elements) {
-        if (el['type'] == 'way' && el['id'] != bestWayId && el['geometry'] != null) {
-          otherGeoms[el['id'] as int] = el['geometry'] as List;
-        }
-      }
+      final segBearing = _bearing(pts[segIdx], pts[segIdx + 1]);
+      double hdgDiff = (_lastHeading ?? segBearing) - segBearing;
+      if (hdgDiff > 180) hdgDiff -= 360;
+      if (hdgDiff < -180) hdgDiff += 360;
+      final goingForward = hdgDiff.abs() <= 90;
 
-      _turnDebug.nodeToWaysCount = nodeToWays.length;
-      _turnDebug.waysCount = elements.where((e) => e['type'] == 'way').length;
-
-      final int scanLimit = goingForward
-          ? (nodes.length < points.length ? nodes.length : points.length)
+      final scanLimit = goingForward
+          ? (nodes.length < pts.length ? nodes.length : pts.length)
           : 0;
-      final int scanStep = goingForward ? 1 : -1;
+      final scanStep = goingForward ? 1 : -1;
 
-      for (int j = startIndex; goingForward ? j < scanLimit : j >= scanLimit; j += scanStep) {
-        final dist = _distance(lat, lon, points[j].latitude, points[j].longitude);
+      if (roadId == bestWay?['id']) {
+        _turnDebug.goingForward = goingForward;
+        _turnDebug.totalPoints = pts.length;
+        _turnDebug.hasNodes = true;
+        _turnDebug.nodeCount = nodes.length;
+        _turnDebug.phase1Executed = true;
+      }
+
+      // FIX BUG 2: backward scan starts at segment end, not segment start
+      final scanStart = goingForward ? segIdx : segIdx + 1;
+
+      for (int j = scanStart;
+          goingForward ? j < scanLimit : j >= scanLimit;
+          j += scanStep) {
+        final dist = _distance(lat, lon, pts[j].latitude, pts[j].longitude);
         if (dist > scanRadius) break;
 
         final nodeId = nodes[j] as int;
         final waysHere = nodeToWays[nodeId] ?? [];
         final isJunction = waysHere.length > 1;
 
-        _turnDebug.phase1Entries.add(Phase1Entry(
-          nodeIndex: j,
-          nodeId: nodeId,
-          waysHere: waysHere.length,
-          distance: dist,
-          isJunction: isJunction,
-        ));
+        if (roadId == bestWay?['id']) {
+          _turnDebug.phase1Entries.add(Phase1Entry(
+            nodeIndex: j,
+            nodeId: nodeId,
+            waysHere: waysHere.length,
+            distance: dist,
+            isJunction: isJunction,
+          ));
+        }
 
         if (!isJunction) continue;
 
         final approach = goingForward
-            ? _bearing(points[j > 0 ? j - 1 : 0], points[j])
-            : _bearing(points[j + 1 < points.length ? j + 1 : points.length - 1], points[j]);
+            ? _bearing(pts[j > 0 ? j - 1 : 0], pts[j])
+            : _bearing(pts[j + 1 < pts.length ? j + 1 : pts.length - 1], pts[j]);
 
         final sideRoads = <String>{};
+        double? maxAngleDiff;
+
         for (final otherId in waysHere) {
-          if (otherId == bestWayId) continue;
+          if (otherId == roadId) continue;
           final otherGeom = otherGeoms[otherId];
           if (otherGeom == null) continue;
 
@@ -1736,8 +1812,8 @@ class _HomePageState extends State<HomePage> {
             final og = otherGeom[k] as Map<String, dynamic>;
             final oLat = og['lat'] as double;
             final oLon = og['lon'] as double;
-            if ((oLat - points[j].latitude).abs() < 0.00001 &&
-                (oLon - points[j].longitude).abs() < 0.00001) {
+            if ((oLat - pts[j].latitude).abs() < 0.00001 &&
+                (oLon - pts[j].longitude).abs() < 0.00001) {
               otherIdx = k;
               break;
             }
@@ -1749,12 +1825,16 @@ class _HomePageState extends State<HomePage> {
 
           final ogDir = otherGeom[dirIdx] as Map<String, dynamic>;
           final brg = _bearing(
-            points[j],
+            pts[j],
             LatLng(ogDir['lat'] as double, ogDir['lon'] as double),
           );
 
           double diff = (brg - approach) % 360;
           if (diff > 180) diff -= 360;
+
+          if (maxAngleDiff == null || diff.abs() > maxAngleDiff.abs()) {
+            maxAngleDiff = diff;
+          }
 
           if (diff.abs() <= 30) {
             sideRoads.add("straight");
@@ -1766,11 +1846,12 @@ class _HomePageState extends State<HomePage> {
         }
 
         final hasStraight = goingForward
-            ? (j + 1 < points.length)
+            ? (j + 1 < pts.length)
             : (j > 0);
         final dirs = Set<String>.from(sideRoads);
         if (hasStraight) dirs.add("straight");
 
+        // FIX BUG 5: Angle-based classification
         String type;
         if (dirs.contains("straight") && dirs.length >= 3) {
           type = "cross";
@@ -1778,140 +1859,71 @@ class _HomePageState extends State<HomePage> {
           type = "t_junction";
         } else if (dirs.length == 1 && dirs.contains("straight")) {
           continue;
-        } else if (dirs.length == 1) {
-          type = dirs.first == "left" ? "left_turn" : "right_turn";
+        } else if (dirs.length == 1 && maxAngleDiff != null) {
+          final absAngle = maxAngleDiff.abs();
+          final dir = maxAngleDiff > 0 ? "right" : "left";
+          if (absAngle > 150) {
+            type = "hairpin_$dir";
+          } else if (absAngle > 90) {
+            type = "sharp_$dir";
+          } else if (absAngle > 30) {
+            type = "${dir}_turn";
+          } else {
+            type = "slight_$dir";
+          }
         } else {
           continue;
         }
 
-        _turnDebug.phase1Entries.last.junctionType = type;
-        _turnDebug.phase1Entries.last.junctionDetails = {
-          'approach': approach,
-          'dirs': dirs.toList(),
-          'sideRoads': sideRoads.toList(),
-          'hasStraight': hasStraight,
-        };
+        if (roadId == bestWay?['id']) {
+          _turnDebug.phase1Entries.last.junctionType = type;
+          _turnDebug.phase1Entries.last.junctionDetails = {
+            'approach': approach,
+            'dirs': dirs.toList(),
+            'sideRoads': sideRoads.toList(),
+            'hasStraight': hasStraight,
+            'angle': maxAngleDiff,
+          };
+        }
 
-        _turnDebug.phase1EarlyReturned = true;
-        _turnDebug.phase1ReturnType = type;
-        _turnDebug.phase1ReturnDist = dist;
-
-        debugPrint('🚧 Phase1 early return: $type at ${dist.toStringAsFixed(1)}m — $dirs');
-        final result = {
+        allJunctions.add({
           "exists": true,
           "type": type,
           "distance": dist,
-          "intersectionLat": points[j].latitude,
-          "intersectionLng": points[j].longitude,
+          "angle": maxAngleDiff ?? 0,
+          "intersectionLat": pts[j].latitude,
+          "intersectionLng": pts[j].longitude,
           "directions": dirs.toList(),
-        };
-        _turnDebug.detectResult = result;
-        return result;
-      }
-    } else {
-      _turnDebug.phase1Executed = true;
-      _turnDebug.hasNodes = false;
-      _turnDebug.nodeCount = nodes?.length ?? 0;
-    }
+          "approachBearing": approach,
+          "roads": waysHere,
+          "roadId": roadId,
+        });
 
-    // ─── PHASE 2: Road bend detection ───
-    _turnDebug.phase2Executed = true;
-    _turnDebug.bendThreshold = 45.0;
-    _turnDebug.maxAngleChange = 0;
-    _turnDebug.segmentsWithinRadius = 0;
-
-    if (goingForward) {
-      for (int j = startIndex; j + 2 < points.length; j++) {
-        final dist = _distance(lat, lon, points[j + 1].latitude, points[j + 1].longitude);
-        if (dist > scanRadius) break;
-
-        _turnDebug.segmentsWithinRadius = (_turnDebug.segmentsWithinRadius ?? 0) + 1;
-
-        final b1 = _bearing(points[j], points[j + 1]);
-        final b2 = _bearing(points[j + 1], points[j + 2]);
-        double angleChange = b2 - b1;
-        if (angleChange > 180) angleChange -= 360;
-        if (angleChange < -180) angleChange += 360;
-
-        final above = angleChange.abs() >= 45.0;
-        if (angleChange.abs() > (_turnDebug.maxAngleChange ?? 0)) {
-          _turnDebug.maxAngleChange = angleChange.abs();
-        }
-
-        _turnDebug.phase2Entries.add(Phase2Entry(
-          segmentIndex: j,
-          distance: dist,
-          bearing1: b1,
-          bearing2: b2,
-          angleChange: angleChange,
-          aboveThreshold: above,
-        ));
-
-        if (above) {
-          final type = angleChange > 0 ? "right_bend" : "left_bend";
-          _turnDebug.bendDetected = true;
-          _turnDebug.phase2Result = '$type at ${dist.toStringAsFixed(1)}m';
-          debugPrint('↩️ $type at ${dist.toStringAsFixed(1)}m (angle: ${angleChange.toStringAsFixed(1)}°)');
-          final result = {
-            "exists": true,
-            "type": type,
-            "distance": dist,
-            "intersectionLat": points[j + 1].latitude,
-            "intersectionLng": points[j + 1].longitude,
-          };
-          _turnDebug.detectResult = result;
-          return result;
-        }
-      }
-    } else {
-      for (int j = startIndex; j >= 2; j--) {
-        final dist = _distance(lat, lon, points[j - 1].latitude, points[j - 1].longitude);
-        if (dist > scanRadius) break;
-
-        _turnDebug.segmentsWithinRadius = (_turnDebug.segmentsWithinRadius ?? 0) + 1;
-
-        final b1 = _bearing(points[j], points[j - 1]);
-        final b2 = _bearing(points[j - 1], points[j - 2]);
-        double angleChange = b2 - b1;
-        if (angleChange > 180) angleChange -= 360;
-        if (angleChange < -180) angleChange += 360;
-
-        final above = angleChange.abs() >= 45.0;
-        if (angleChange.abs() > (_turnDebug.maxAngleChange ?? 0)) {
-          _turnDebug.maxAngleChange = angleChange.abs();
-        }
-
-        _turnDebug.phase2Entries.add(Phase2Entry(
-          segmentIndex: j,
-          distance: dist,
-          bearing1: b1,
-          bearing2: b2,
-          angleChange: angleChange,
-          aboveThreshold: above,
-        ));
-
-        if (above) {
-          final type = angleChange > 0 ? "right_bend" : "left_bend";
-          _turnDebug.bendDetected = true;
-          _turnDebug.phase2Result = '$type at ${dist.toStringAsFixed(1)}m';
-          final result = {
-            "exists": true,
-            "type": type,
-            "distance": dist,
-            "intersectionLat": points[j - 1].latitude,
-            "intersectionLng": points[j - 1].longitude,
-          };
-          _turnDebug.detectResult = result;
-          return result;
-        }
+        debugPrint('🚧 Junction found: $type at ${dist.toStringAsFixed(1)}m on road $roadId');
       }
     }
 
-    _turnDebug.bendDetected = false;
-    _turnDebug.phase2Result = 'No angle ≥ 45° (max: ${_turnDebug.maxAngleChange?.toStringAsFixed(1)}°)';
-    final noneResult = {"exists": false, "distance": null};
-    _turnDebug.detectResult = noneResult;
-    return noneResult;
+    // FIX BUG 4: Deduplicate by coordinate proximity
+    final deduped = _deduplicateJunctions(allJunctions);
+
+    final allTurns = deduped
+      ..sort((a, b) => (a['distance'] as double).compareTo(b['distance'] as double));
+
+    _turnDebug.phase1EarlyReturned = false; // FIX BUG 1: no early return
+    _turnDebug.detectResult = allTurns.isNotEmpty ? allTurns.first : {"exists": false, "distance": null};
+    _turnDebug.turnExists = allTurns.isNotEmpty;
+    _turnDebug.turnType = allTurns.isNotEmpty ? allTurns.first['type']?.toString() : null;
+    _turnDebug.turnDistance = allTurns.isNotEmpty ? allTurns.first['distance']?.toDouble() : null;
+    _turnDebug.allJunctionsCount = allJunctions.length;
+    _turnDebug.dedupedJunctionsCount = deduped.length;
+    _turnDebug.filteredJunctionsCount = deduped.length;
+    _turnDebug.finalTurns = allTurns;
+
+    if (allTurns.isNotEmpty) {
+      debugPrint('🚧 ${allTurns.length} turn(s) ahead: ${allTurns.map((t) => '${t['type']} @ ${(t['distance'] as double).toStringAsFixed(1)}m').join(', ')}');
+    }
+
+    return allTurns;
   }
 
   // Helper function to calculate distance from a point to a line segment
@@ -1964,15 +1976,18 @@ class _HomePageState extends State<HomePage> {
   Future<void> _checkTurnAhead() async {
     try {
       final now = DateTime.now();
-      final result = await _detectTurnAhead();
+      final turns = await _detectTurnAhead();
       _lastTurnCheckTime = now;
       _lastTurnCheckPosition = _fusedPosition;
 
-      _turnDebug.detectResult = result;
-      _turnDebug.turnInfoApplied = result ?? {"exists": false, "distance": null};
-      _turnDebug.turnExists = result?['exists'] == true;
-      _turnDebug.turnType = result?['type']?.toString();
-      _turnDebug.turnDistance = result?['distance']?.toDouble();
+      _detectedTurns = turns;
+      _primaryTurn = turns.isNotEmpty ? turns.first : null;
+
+      _turnDebug.detectResult = turns.isNotEmpty ? turns.first : null;
+      _turnDebug.turnInfoApplied = _primaryTurn ?? {"exists": false, "distance": null};
+      _turnDebug.turnExists = turns.isNotEmpty;
+      _turnDebug.turnType = turns.isNotEmpty ? turns.first['type']?.toString() : null;
+      _turnDebug.turnDistance = turns.isNotEmpty ? turns.first['distance']?.toDouble() : null;
 
       if (mounted && _isRecording) {
         _captureSnapshot();
@@ -1980,13 +1995,12 @@ class _HomePageState extends State<HomePage> {
 
       if (mounted) {
         setState(() {
-          _turnInfo = result ?? {"exists": false, "distance": null};
-          if (result != null && result['exists'] == true && _turnDetectedAt == null) {
+          if (turns.isNotEmpty && _turnDetectedAt == null) {
             _turnDetectedAt = _fusedPosition;
-          } else if (result == null || result['exists'] != true) {
+          } else if (turns.isEmpty) {
             _turnDetectedAt = null;
           }
-          _turnDetectionMarkers = _buildTurnMarkers(result);
+          _turnDetectionMarkers = _buildTurnMarkers(turns.isNotEmpty ? turns.first : null);
         });
       }
     } catch (e) {
@@ -1996,7 +2010,8 @@ class _HomePageState extends State<HomePage> {
       debugPrint('❌ _checkTurnAhead error: $e');
       if (mounted) {
         setState(() {
-          _turnInfo = {"exists": false, "distance": null};
+          _primaryTurn = null;
+          _detectedTurns = [];
         });
       }
     }
@@ -2394,10 +2409,11 @@ class _HomePageState extends State<HomePage> {
                           hasCompassHeading: _hasCompassHeading,
                           usingGpsCourse: _usingGpsCourse,
                           pendingMessagesCount: _pendingMessages.length,
-                          turnExists: _turnInfo != null && _turnInfo!['exists'] == true,
-                          turnType: _turnInfo?['type']?.toString(),
-                          turnDistance: _turnInfo?['distance']?.toDouble(),
-                          turnInfo: _turnInfo,
+                          turnExists: _detectedTurns.isNotEmpty,
+                          turnType: _primaryTurn?['type']?.toString(),
+                          turnDistance: _primaryTurn?['distance']?.toDouble(),
+                          turnInfo: _primaryTurn,
+                          detectedTurns: _detectedTurns,
                           onClose: () {
                             setState(() {
                               _showDataViewer = false;
@@ -2412,7 +2428,7 @@ class _HomePageState extends State<HomePage> {
                       ),
                   ),
                 // ─── Turn/junction info card at bottom ───
-                if (_turnInfo != null && _turnInfo!['exists'] == true)
+                if (_primaryTurn != null)
                   Positioned(
                     bottom: 160,
                     left: 16,
@@ -2423,7 +2439,7 @@ class _HomePageState extends State<HomePage> {
                       child: Container(
                         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
                         decoration: BoxDecoration(
-                          color: _turnInfo!['type'] == 'left_bend' || _turnInfo!['type'] == 'right_bend'
+                          color: _primaryTurn!['type'] == 'left_bend' || _primaryTurn!['type'] == 'right_bend'
                               ? Colors.red.shade700
                               : Colors.orange.shade800,
                           borderRadius: BorderRadius.circular(12),
@@ -2438,7 +2454,7 @@ class _HomePageState extends State<HomePage> {
                         child: Row(
                           children: [
                             Icon(
-                              _buildTurnIcon(_turnInfo!['type']),
+                              _buildTurnIcon(_primaryTurn!['type']),
                               color: Colors.white,
                               size: 28,
                             ),
@@ -2456,9 +2472,9 @@ class _HomePageState extends State<HomePage> {
                                       fontWeight: FontWeight.bold,
                                     ),
                                   ),
-                                  if (_turnInfo!['distance'] != null)
+                                  if (_primaryTurn!['distance'] != null)
                                     Text(
-                                      '${(_turnInfo!['distance'] as double).toStringAsFixed(0)}m ahead',
+                                      '${(_primaryTurn!['distance'] as double).toStringAsFixed(0)}m ahead',
                                       style: TextStyle(
                                         color: Colors.white.withOpacity(0.9),
                                         fontSize: 13,
@@ -2578,13 +2594,89 @@ class _HomePageState extends State<HomePage> {
                       ),
                     ),
                   ),
+                // ─── Frontend-detected additional turns (2nd, 3rd) ───
+                if (_detectedTurns.length > 1)
+                  Positioned(
+                    bottom: 110,
+                    left: 16,
+                    right: 16,
+                    child: Container(
+                      constraints: const BoxConstraints(maxHeight: 80),
+                      padding: const EdgeInsets.all(8),
+                      decoration: BoxDecoration(
+                        color: Colors.black87,
+                        borderRadius: BorderRadius.circular(10),
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.black.withOpacity(0.4),
+                            blurRadius: 6,
+                            offset: const Offset(0, 2),
+                          ),
+                        ],
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          const Text(
+                            'NEXT TURNS',
+                            style: TextStyle(
+                              color: Colors.white54,
+                              fontSize: 9,
+                              fontWeight: FontWeight.bold,
+                              letterSpacing: 1,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Flexible(
+                            child: ListView.builder(
+                              shrinkWrap: true,
+                              itemCount: _detectedTurns.length - 1,
+                              itemBuilder: (context, idx) {
+                                final i = idx + 1;
+                                final turn = _detectedTurns[i];
+                                final type = turn['type'] as String? ?? '?';
+                                final dist = (turn['distance'] as double?)?.toInt() ?? 0;
+                                return Padding(
+                                  padding: const EdgeInsets.symmetric(vertical: 1),
+                                  child: Row(
+                                    children: [
+                                      Icon(_buildTurnIcon(type), color: Colors.orange, size: 12),
+                                      const SizedBox(width: 6),
+                                      Expanded(
+                                        child: Text(
+                                          _formatTurnType(type),
+                                          style: const TextStyle(
+                                            color: Colors.orangeAccent,
+                                            fontSize: 11,
+                                            fontWeight: FontWeight.w500,
+                                          ),
+                                        ),
+                                      ),
+                                      Text(
+                                        '${dist}m',
+                                        style: const TextStyle(
+                                          color: Colors.white54,
+                                          fontSize: 10,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                );
+                              },
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
               ],
             ),
     );
   }
 
   String _buildTurnTitle() {
-    final type = _turnInfo?['type'] as String?;
+    final type = _primaryTurn?['type'] as String?;
     switch (type) {
       case 'left_turn': case 'left': return 'LEFT TURN';
       case 'right_turn': case 'right': return 'RIGHT TURN';

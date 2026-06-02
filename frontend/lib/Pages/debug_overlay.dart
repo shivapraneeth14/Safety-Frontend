@@ -22,6 +22,7 @@ class DebugOverlay extends StatelessWidget {
   final String? turnType;
   final double? turnDistance;
   final Map<String, dynamic>? turnInfo;
+  final List<Map<String, dynamic>> detectedTurns;
   final VoidCallback? onClose;
   final bool isRecording;
   final int recordingSeconds;
@@ -50,6 +51,7 @@ class DebugOverlay extends StatelessWidget {
     this.turnType,
     this.turnDistance,
     this.turnInfo,
+    this.detectedTurns = const [],
     this.onClose,
     this.isRecording = false,
     this.recordingSeconds = 0,
@@ -103,6 +105,7 @@ class DebugOverlay extends StatelessWidget {
             _section('WS PAYLOAD', _wsPayloadContent(), Colors.blue),
             _section('ACTIVE THREATS', _threatsContent(), Colors.red),
             _section('UPCOMING TURNS (backend)', _backendTurnsContent(), Colors.tealAccent),
+            _section('DETECTED TURNS (frontend)', _frontendTurnsContent(), Colors.amber),
             _section('RECORDING', _recordingContent(), Colors.redAccent),
             _section('RAW DEBUG JSON', _rawJsonContent(), Colors.grey),
             const SizedBox(height: 12),
@@ -404,8 +407,33 @@ class DebugOverlay extends StatelessWidget {
             style: const TextStyle(color: Colors.white70, fontSize: 8, fontFamily: 'monospace'),
           ),
         ),
+        if (r['multiTurn'] != null)
+          ..._buildMultiTurnResult(r['multiTurn']),
       ],
     );
+  }
+
+  List<Widget> _buildMultiTurnResult(dynamic mt) {
+    return [
+      const SizedBox(height: 6),
+      const Text('MULTI-TURN PIPELINE:',
+        style: TextStyle(color: Colors.amber, fontSize: 10, fontWeight: FontWeight.bold)),
+      const SizedBox(height: 2),
+      _item('All junctions (raw)', mt['allJunctionsCount'] ?? 0),
+      _item('After dedup (15m)', mt['dedupedCount'] ?? 0),
+      _item('After cone filter (60°)', mt['filteredCount'] ?? 0),
+      _item('Final turns (top 3)', (mt['finalTurns'] as List?)?.length ?? 0),
+      if ((mt['finalTurns'] as List?)?.isNotEmpty == true) ...[
+        const SizedBox(height: 4),
+        ...(mt['finalTurns'] as List).map((t) => Padding(
+          padding: const EdgeInsets.only(bottom: 2),
+          child: Text(
+            _fmtJson(t),
+            style: const TextStyle(color: Colors.amberAccent, fontSize: 8, fontFamily: 'monospace'),
+          ),
+        )),
+      ],
+    ];
   }
 
   Widget _wsPayloadContent() {
@@ -458,6 +486,29 @@ class DebugOverlay extends StatelessWidget {
           style: const TextStyle(color: Colors.tealAccent, fontSize: 10)),
         const SizedBox(height: 4),
         ...upcomingTurns.map((t) {
+          return Padding(
+            padding: const EdgeInsets.only(bottom: 2),
+            child: Text(
+              _fmtJson(t),
+              style: const TextStyle(color: Colors.white70, fontSize: 8, fontFamily: 'monospace'),
+            ),
+          );
+        }),
+      ],
+    );
+  }
+
+  Widget _frontendTurnsContent() {
+    if (detectedTurns.isEmpty) {
+      return const Text('(none)', style: TextStyle(color: Colors.white38, fontSize: 10));
+    }
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text('${detectedTurns.length} turn(s)',
+          style: const TextStyle(color: Colors.amber, fontSize: 10)),
+        const SizedBox(height: 4),
+        ...detectedTurns.map((t) {
           return Padding(
             padding: const EdgeInsets.only(bottom: 2),
             child: Text(

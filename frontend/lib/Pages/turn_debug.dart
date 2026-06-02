@@ -63,6 +63,12 @@ class TurnDebugInfo {
   String? turnType;
   double? turnDistance;
 
+  // Multi-turn result (FIX BUG 1, 3, 4, 6)
+  int? allJunctionsCount;
+  int? dedupedJunctionsCount;
+  int? filteredJunctionsCount;
+  List<Map<String, dynamic>> finalTurns = [];
+
   // WS payload
   Map<String, dynamic>? lastWsPayload;
 
@@ -165,6 +171,12 @@ class TurnDebugInfo {
         'turnExists': turnExists,
         'turnType': turnType,
         'turnDistance': turnDistance,
+        'multiTurn': {
+          'allJunctionsCount': allJunctionsCount,
+          'dedupedCount': dedupedJunctionsCount,
+          'filteredCount': filteredJunctionsCount,
+          'finalTurns': finalTurns,
+        },
       },
       'lastWsPayload': lastWsPayload,
     };
