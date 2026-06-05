@@ -216,7 +216,9 @@ class _HomePageState extends State<HomePage> {
   List<Marker> _threatMarkers = [];
   // Turn debug markers
   List<Marker> _turnDetectionMarkers = [];
-  LatLng? _turnDetectedAt;
+  LatLng? _turnMarkerPosition;
+  String? _turnMarkerType;
+  double _minDistToTurn = double.infinity;
   // Active threats for banners
   List<Map<String, dynamic>> _activeThreats = [];
   Timer? _clearThreatTimer;
@@ -486,6 +488,9 @@ class _HomePageState extends State<HomePage> {
     // Trigger a turn-check when position changes significantly (rate-limited)
     _maybeScheduleTurnCheck();
 
+    // Check if turn marker should be cleared (crossed the turn)
+    _checkTurnCrossed();
+
     setState(() {});
   }
 
@@ -523,57 +528,59 @@ class _HomePageState extends State<HomePage> {
   }
 
   List<Marker> _buildTurnMarkers(Map<String, dynamic>? primaryTurn) {
-    final markers = <Marker>[];
-
-    if (_turnDetectedAt != null) {
-      markers.add(Marker(
-        point: _turnDetectedAt!,
-        width: 20, height: 20,
+    if (_turnMarkerPosition == null) return [];
+    return [
+      Marker(
+        point: _turnMarkerPosition!,
+        width: 90,
+        height: 32,
         child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
           decoration: BoxDecoration(
-            color: Colors.yellow, shape: BoxShape.circle,
+            color: Colors.amber.shade600,
+            borderRadius: BorderRadius.circular(8),
             border: Border.all(color: Colors.black, width: 2),
+            boxShadow: [
+              BoxShadow(color: Colors.black.withOpacity(0.4), blurRadius: 4),
+            ],
           ),
-          child: const Center(child: Text('D', style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold, color: Colors.black))),
-        ),
-      ));
-    }
-
-    // FIX BUG 3: Markers for ALL detected turns
-    for (int i = 0; i < _detectedTurns.length; i++) {
-      final turn = _detectedTurns[i];
-      if (turn['exists'] != true) continue;
-      final lat = turn['intersectionLat'] as double?;
-      final lng = turn['intersectionLng'] as double?;
-      if (lat == null || lng == null) continue;
-      final type = turn['type'] as String? ?? '?';
-      final dist = (turn['distance'] as double?)?.toInt() ?? 0;
-      final isPrimary = i == 0;
-
-      markers.add(Marker(
-        point: LatLng(lat, lng),
-        width: isPrimary ? 56 : 44,
-        height: isPrimary ? 28 : 24,
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
-          decoration: BoxDecoration(
-            color: isPrimary ? Colors.red.shade800 : Colors.orange.shade700,
-            borderRadius: BorderRadius.circular(6),
-            border: Border.all(color: Colors.white, width: isPrimary ? 1 : 0.5),
-          ),
-          child: Text(
-            '${type.toUpperCase()} ${dist}m',
-            style: TextStyle(
-              color: Colors.white,
-              fontSize: isPrimary ? 9 : 8,
-              fontWeight: isPrimary ? FontWeight.bold : FontWeight.normal,
-            ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.turn_slight_right, color: Colors.black, size: 16),
+              const SizedBox(width: 4),
+              Text(
+                _turnMarkerType?.toUpperCase() ?? 'TURN',
+                style: const TextStyle(
+                  color: Colors.black,
+                  fontSize: 11,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ],
           ),
         ),
-      ));
-    }
+      ),
+    ];
+  }
 
-    return markers;
+  void _checkTurnCrossed() {
+    if (_turnMarkerPosition == null || _fusedPosition == null) return;
+    final d = _distance(
+      _turnMarkerPosition!.latitude, _turnMarkerPosition!.longitude,
+      _fusedPosition!.latitude, _fusedPosition!.longitude,
+    );
+    if (d < _minDistToTurn) _minDistToTurn = d;
+    if (_minDistToTurn < 10.0 && d > 25.0) {
+      _turnMarkerPosition = null;
+      _turnMarkerType = null;
+      _minDistToTurn = double.infinity;
+      if (mounted) {
+        setState(() {
+          _turnDetectionMarkers = _buildTurnMarkers(null);
+        });
+      }
+    }
   }
 
   LatLng _projectOnSegment(LatLng p, LatLng a, LatLng b) {
@@ -2004,10 +2011,17 @@ class _HomePageState extends State<HomePage> {
 
       if (mounted) {
         setState(() {
-          if (turns.isNotEmpty && _turnDetectedAt == null) {
-            _turnDetectedAt = _fusedPosition;
-          } else if (turns.isEmpty) {
-            _turnDetectedAt = null;
+          if (turns.isNotEmpty && _turnMarkerPosition == null) {
+            final t = turns.first;
+            _turnMarkerPosition = LatLng(
+              (t['intersectionLat'] as num).toDouble(),
+              (t['intersectionLng'] as num).toDouble(),
+            );
+            _turnMarkerType = t['type']?.toString() ?? 'TURN';
+            _minDistToTurn = _distance(
+              _turnMarkerPosition!.latitude, _turnMarkerPosition!.longitude,
+              _fusedPosition!.latitude, _fusedPosition!.longitude,
+            );
           }
           _turnDetectionMarkers = _buildTurnMarkers(turns.isNotEmpty ? turns.first : null);
         });
@@ -2508,7 +2522,7 @@ class _HomePageState extends State<HomePage> {
                 // ─── Turn/junction info card at bottom ───
                 if (_primaryTurn != null)
                   Positioned(
-                    bottom: 160,
+                    bottom: 8,
                     left: 16,
                     right: 16,
                     child: AnimatedOpacity(
@@ -2569,7 +2583,7 @@ class _HomePageState extends State<HomePage> {
                 // ─── Upcoming turns list (from backend cone query) ───
                 if (_upcomingTurns.isNotEmpty)
                   Positioned(
-                    bottom: 250,
+                    bottom: 80,
                     left: 16,
                     right: 16,
                     child: Container(
@@ -2675,7 +2689,7 @@ class _HomePageState extends State<HomePage> {
                 // ─── Frontend-detected additional turns (2nd, 3rd) ───
                 if (_detectedTurns.length > 1)
                   Positioned(
-                    bottom: 110,
+                    bottom: 80,
                     left: 16,
                     right: 16,
                     child: Container(
