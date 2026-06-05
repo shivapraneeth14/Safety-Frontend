@@ -253,6 +253,7 @@ class _HomePageState extends State<HomePage> {
 
   // Data viewer
   bool _showDataViewer = false;
+  bool _showBoundingBox = false;
   Map<String, dynamic>? _lastSentData;
 
   // Sprint 1: Kalman filter
@@ -2320,6 +2321,23 @@ class _HomePageState extends State<HomePage> {
                             "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
                         userAgentPackageName: 'com.example.frontend',
                       ),
+                      if (_showBoundingBox)
+                        PolygonLayer(
+                          polygons: [
+                            Polygon<Object>(
+                              points: const [
+                                LatLng(17.305, 78.495),
+                                LatLng(17.305, 78.625),
+                                LatLng(17.445, 78.625),
+                                LatLng(17.445, 78.495),
+                              ],
+                              color: Colors.blue.withValues(alpha: 0.15),
+                              borderColor: Colors.blue,
+                              borderStrokeWidth: 2.5,
+                              label: 'Detection Zone',
+                            ),
+                          ],
+                        ),
                       MarkerLayer(
                         markers: [
                           Marker(
@@ -2347,6 +2365,27 @@ class _HomePageState extends State<HomePage> {
                       if (_turnDetectionMarkers.isNotEmpty)
                         MarkerLayer(markers: _turnDetectionMarkers),
                     ],
+                  ),
+                ),
+                // Bounding box toggle
+                Positioned(
+                  top: _activeThreats.isNotEmpty ? 140 : 80,
+                  left: 8,
+                  child: FloatingActionButton.small(
+                    heroTag: 'bbox_toggle',
+                    onPressed: () =>
+                        setState(() => _showBoundingBox = !_showBoundingBox),
+                    backgroundColor:
+                        _showBoundingBox ? Colors.blue : Colors.grey[300],
+                    tooltip: _showBoundingBox
+                        ? 'Hide detection zone'
+                        : 'Show detection zone',
+                    child: Icon(
+                      Icons.aspect_ratio,
+                      color: _showBoundingBox
+                          ? Colors.white
+                          : Colors.grey[700],
+                    ),
                   ),
                 ),
                 // My Location Button
