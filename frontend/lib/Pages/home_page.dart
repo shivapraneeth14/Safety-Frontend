@@ -247,6 +247,7 @@ class _HomePageState extends State<HomePage> {
 
   // Status indicators
   bool _isConnected = false;
+  bool _redisConnected = false;
   bool _isSendingData = false;
   DateTime? _lastDataSent;
   String _connectionStatus = 'Connecting...';
@@ -924,6 +925,13 @@ class _HomePageState extends State<HomePage> {
             });
           }
         });
+      }
+
+      // Extract Redis connection status
+      if (payload['redisConnected'] is bool) {
+        if (mounted) {
+          setState(() => _redisConnected = payload['redisConnected'] as bool);
+        }
       }
 
       // Extract upcoming turns from backend response
@@ -2075,7 +2083,38 @@ class _HomePageState extends State<HomePage> {
                               ],
                             ),
                           ),
-                          const SizedBox(width: 8),
+                          const SizedBox(width: 6),
+                          // Redis Status
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 6,
+                              vertical: 4,
+                            ),
+                            decoration: BoxDecoration(
+                              color: _redisConnected ? Colors.green : Colors.red,
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(
+                                  _redisConnected ? Icons.storage : Icons.storage_outlined,
+                                  color: Colors.white,
+                                  size: 14,
+                                ),
+                                const SizedBox(width: 3),
+                                Text(
+                                  _redisConnected ? 'DB' : 'DB',
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w500,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(width: 6),
                           // Data Transmission Indicator
                           if (_isSendingData)
                             Container(
