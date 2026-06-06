@@ -19,6 +19,7 @@ import 'turn_debug.dart';
 import 'dart:io';
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
+import 'package:hive_flutter/hive_flutter.dart';
 
 class KalmanFilter {
   double lat, lon, vLat, vLon;
@@ -106,13 +107,20 @@ class KalmanFilter {
     p11 = (1 - kLon) * p11;
 
       if (speed > 0.5 && heading >= 0) {
-          final hRad = heading * pi / 180.0;
-          final vxTarget = speed * sin(hRad);
-          final vyTarget = speed * cos(hRad);
-      const velGain = 0.3;
-      vLat += velGain * (vxTarget - vLat);
-      vLon += velGain * (vyTarget - vLon);
-    }
+        final hRad = heading * pi / 180.0;
+        final metersPerDegLat = 111320.0;
+        final cosLat = cos(latitude * pi / 180.0).clamp(0.01, 1.0);
+        final metersPerDegLon = 111320.0 * cosLat;
+
+        // North-south component → lat velocity (deg/s)
+        final vLatTarget = speed * cos(hRad) / metersPerDegLat;
+        // East-west component → lon velocity (deg/s)
+        final vLonTarget = speed * sin(hRad) / metersPerDegLon;
+
+        const velGain = 0.3;
+        vLat += velGain * (vLatTarget - vLat);
+        vLon += velGain * (vLonTarget - vLon);
+      }
   }
 
   double getUncertainty() {
@@ -301,6 +309,7 @@ class _HomePageState extends State<HomePage> {
     super.initState();
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       await fetchUserProfile();
+      await _loadRoadCache();
       _initLocation();
       _initConnectivity();
       _initCompass();
@@ -1112,6 +1121,12 @@ class _HomePageState extends State<HomePage> {
     final effectiveLat = (_onRoad && _snappedPosition != null) ? _snappedPosition!.latitude : _fusedPosition!.latitude;
     final effectiveLng = (_onRoad && _snappedPosition != null) ? _snappedPosition!.longitude : _fusedPosition!.longitude;
 
+    // Reject out-of-range coordinates to prevent backend corruption
+    if (effectiveLat < -90 || effectiveLat > 90 || effectiveLng < -180 || effectiveLng > 180) {
+      debugPrint('⚠️ Invalid coordinates rejected: $effectiveLat, $effectiveLng');
+      return;
+    }
+
     final payload = {
       "userId": user!['_id'],
       "latitude": effectiveLat,
@@ -1542,6 +1557,43 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  Future<void> _loadRoadCache() async {
+    try {
+      final box = Hive.box('roadCache');
+      final cached = box.get('roadElements');
+      final cachedTime = box.get('roadCacheTime');
+      final cachedLat = box.get('roadCacheLat');
+      final cachedLon = box.get('roadCacheLon');
+      if (cached != null && cachedTime != null && cachedLat != null && cachedLon != null) {
+        final age = DateTime.now().millisecondsSinceEpoch - (cachedTime as int);
+        if (age < 24 * 60 * 60 * 1000) {
+          _cachedRoadData = (cached as List).cast<dynamic>();
+          _cachedRoadDataTime = DateTime.fromMillisecondsSinceEpoch(cachedTime);
+          _lastRoadFetchPosition = LatLng(cachedLat as double, cachedLon as double);
+          debugPrint('🗺️ Loaded ${_cachedRoadData!.length} roads from persistent cache');
+        } else {
+          debugPrint('🗺️ Persistent cache expired (age=${age ~/ 1000}s)');
+        }
+      }
+    } catch (e) {
+      debugPrint('⚠️ Failed to load road cache: $e');
+    }
+  }
+
+  Future<void> _saveRoadCache() async {
+    if (_cachedRoadData == null || _lastRoadFetchPosition == null) return;
+    try {
+      final box = Hive.box('roadCache');
+      await box.put('roadElements', _cachedRoadData);
+      await box.put('roadCacheTime', DateTime.now().millisecondsSinceEpoch);
+      await box.put('roadCacheLat', _lastRoadFetchPosition!.latitude);
+      await box.put('roadCacheLon', _lastRoadFetchPosition!.longitude);
+      debugPrint('🗺️ Saved ${_cachedRoadData!.length} roads to persistent cache');
+    } catch (e) {
+      debugPrint('⚠️ Failed to save road cache: $e');
+    }
+  }
+
   double _getScanRadius() {
     final speed = _lastSpeed ?? 0;
     if (speed > 13.9) return 150;   // > 50 km/h
@@ -1626,6 +1678,7 @@ class _HomePageState extends State<HomePage> {
       _cachedRoadData = List.from(data['elements']);
       _cachedRoadDataTime = DateTime.now();
       _lastRoadFetchPosition = _fusedPosition;
+      _saveRoadCache();
       return _processTurnDataFromElements(_cachedRoadData!, lat, lon, scanRadius);
     }
 

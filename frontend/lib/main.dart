@@ -1,9 +1,13 @@
 import 'package:flutter/material.dart';
+import 'package:hive_flutter/hive_flutter.dart';
 import 'Pages/login_page.dart';
 import 'Pages/signup_page.dart';
 import 'Pages/main_layout.dart'; // 👈 Import this
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Hive.initFlutter();
+  await Hive.openBox('roadCache');
   runApp(const MyApp());
 }
 
