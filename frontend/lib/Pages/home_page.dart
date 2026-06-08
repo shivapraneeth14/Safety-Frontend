@@ -224,9 +224,8 @@ class _HomePageState extends State<HomePage> {
   List<Marker> _threatMarkers = [];
   // Turn debug markers
   List<Marker> _turnDetectionMarkers = [];
-  LatLng? _turnMarkerPosition;
-  String? _turnMarkerType;
-  double _minDistToTurn = double.infinity;
+  final Set<String> _crossedTurnKeys = {};
+  bool _showTurnPanel = true;
   // Active threats for banners
   List<Map<String, dynamic>> _activeThreats = [];
   Timer? _clearThreatTimer;
@@ -536,19 +535,30 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  List<Marker> _buildTurnMarkers(Map<String, dynamic>? primaryTurn) {
-    if (_turnMarkerPosition == null) return [];
-    return [
-      Marker(
-        point: _turnMarkerPosition!,
-        width: 90,
-        height: 32,
+  List<Marker> _buildTurnMarkers(List<Map<String, dynamic>> turns) {
+    final markers = <Marker>[];
+    for (final turn in turns) {
+      final lat = (turn['intersectionLat'] as num).toDouble();
+      final lng = (turn['intersectionLng'] as num).toDouble();
+      final type = turn['type']?.toString() ?? 'TURN';
+      final dist = (turn['distance'] as num).toDouble();
+      final key = '${lat.toStringAsFixed(5)},${lng.toStringAsFixed(5)}';
+      if (_crossedTurnKeys.contains(key)) continue;
+
+      final isBend = type == 'left_bend' || type == 'right_bend';
+      final bgColor = isBend ? Colors.red.shade700 : Colors.orange.shade800;
+      final icon = _buildTurnIcon(type);
+
+      markers.add(Marker(
+        point: LatLng(lat, lng),
+        width: 100,
+        height: 30,
         child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
           decoration: BoxDecoration(
-            color: Colors.amber.shade600,
+            color: bgColor,
             borderRadius: BorderRadius.circular(8),
-            border: Border.all(color: Colors.black, width: 2),
+            border: Border.all(color: Colors.black87, width: 1.5),
             boxShadow: [
               BoxShadow(color: Colors.black.withOpacity(0.4), blurRadius: 4),
             ],
@@ -556,39 +566,46 @@ class _HomePageState extends State<HomePage> {
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(Icons.turn_slight_right, color: Colors.black, size: 16),
+              Icon(icon, color: Colors.white, size: 14),
               const SizedBox(width: 4),
               Text(
-                _turnMarkerType?.toUpperCase() ?? 'TURN',
+                '${type.toUpperCase()} ${dist.toStringAsFixed(0)}m',
                 style: const TextStyle(
-                  color: Colors.black,
-                  fontSize: 11,
+                  color: Colors.white,
+                  fontSize: 10,
                   fontWeight: FontWeight.bold,
                 ),
               ),
             ],
           ),
         ),
-      ),
-    ];
+      ));
+    }
+    return markers;
   }
 
   void _checkTurnCrossed() {
-    if (_turnMarkerPosition == null || _fusedPosition == null) return;
-    final d = _distance(
-      _turnMarkerPosition!.latitude, _turnMarkerPosition!.longitude,
-      _fusedPosition!.latitude, _fusedPosition!.longitude,
-    );
-    if (d < _minDistToTurn) _minDistToTurn = d;
-    if (_minDistToTurn < 10.0 && d > 25.0) {
-      _turnMarkerPosition = null;
-      _turnMarkerType = null;
-      _minDistToTurn = double.infinity;
-      if (mounted) {
-        setState(() {
-          _turnDetectionMarkers = _buildTurnMarkers(null);
-        });
+    if (_fusedPosition == null || _detectedTurns.isEmpty) return;
+    for (final turn in _detectedTurns) {
+      final lat = (turn['intersectionLat'] as num).toDouble();
+      final lng = (turn['intersectionLng'] as num).toDouble();
+      final key = '${lat.toStringAsFixed(5)},${lng.toStringAsFixed(5)}';
+      if (_crossedTurnKeys.contains(key)) continue;
+      final d = _distance(lat, lng, _fusedPosition!.latitude, _fusedPosition!.longitude);
+      if (turn['_minDist'] == null) {
+        turn['_minDist'] = d;
+      } else {
+        final prev = turn['_minDist'] as double;
+        if (d < prev) turn['_minDist'] = d;
+        if (prev < 10.0 && d > 25.0) {
+          _crossedTurnKeys.add(key);
+        }
       }
+    }
+    if (mounted) {
+      setState(() {
+        _turnDetectionMarkers = _buildTurnMarkers(_detectedTurns);
+      });
     }
   }
 
@@ -1797,8 +1814,9 @@ class _HomePageState extends State<HomePage> {
       return [];
     }
 
-    // ─── FIX BUG 1: Scan ALL roads for junctions ───
+    // ─── Scan ALL roads for junctions ───
     final List<Map<String, dynamic>> allJunctions = [];
+    bool? bestGoingForward;
 
     for (final el in elements) {
       if (el['geometry'] == null) continue;
@@ -1811,6 +1829,13 @@ class _HomePageState extends State<HomePage> {
       final pts = geom
           .map((p) => LatLng(p['lat'] as double, p['lon'] as double))
           .toList();
+
+      // Defensive: skip roads where nodes/geometry length mismatch
+      // (ensures nodes[j] and pts[j] correspond 1:1)
+      if (nodes.length != pts.length) {
+        debugPrint('⚠️ Road $roadId: nodes(${nodes.length}) != geometry(${pts.length}) — skipping');
+        continue;
+      }
 
       double minSegDist = double.infinity;
       int segIdx = 0;
@@ -1826,9 +1851,8 @@ class _HomePageState extends State<HomePage> {
       if (hdgDiff < -180) hdgDiff += 360;
       final goingForward = hdgDiff.abs() <= 90;
 
-      final scanLimit = goingForward
-          ? (nodes.length < pts.length ? nodes.length : pts.length)
-          : 0;
+      // nodes.length == pts.length guaranteed by check above
+      final scanLimit = goingForward ? pts.length : 0;
       final scanStep = goingForward ? 1 : -1;
 
       if (roadId == bestWay?['id']) {
@@ -1837,10 +1861,11 @@ class _HomePageState extends State<HomePage> {
         _turnDebug.hasNodes = true;
         _turnDebug.nodeCount = nodes.length;
         _turnDebug.phase1Executed = true;
+        bestGoingForward = goingForward;
       }
 
-      // FIX BUG 2: backward scan starts at segment end, not segment start
-      final scanStart = goingForward ? segIdx : segIdx + 1;
+      // Fix: start scan at closest segment index (not segIdx+1 for backward)
+      final scanStart = segIdx;
 
       for (int j = scanStart;
           goingForward ? j < scanLimit : j >= scanLimit;
@@ -1864,9 +1889,13 @@ class _HomePageState extends State<HomePage> {
 
         if (!isJunction) continue;
 
+        // Fix: approach bearing with proper edge case handling
+        // Forward: bearing from previous point to this junction
+        // Backward: bearing from next point to this junction
+        // At road ends, fall back to segment bearing
         final approach = goingForward
-            ? _bearing(pts[j > 0 ? j - 1 : 0], pts[j])
-            : _bearing(pts[j + 1 < pts.length ? j + 1 : pts.length - 1], pts[j]);
+            ? (j > 0 ? _bearing(pts[j - 1], pts[j]) : segBearing)
+            : (j + 1 < pts.length ? _bearing(pts[j + 1], pts[j]) : (segBearing + 180) % 360);
 
         final sideRoads = <String>{};
         double? maxAngleDiff;
@@ -1925,7 +1954,12 @@ class _HomePageState extends State<HomePage> {
         if (dirs.contains("straight") && dirs.length >= 3) {
           type = "cross";
         } else if (!dirs.contains("straight") && dirs.length >= 2) {
-          type = "t_junction";
+          // Y-junction: road forks into two different directions
+          if (sideRoads.contains("left") && sideRoads.contains("right") && waysHere.length <= 4) {
+            type = "y_junction";
+          } else {
+            type = "t_junction";
+          }
         } else if (dirs.length == 1 && dirs.contains("straight")) {
           continue;
         } else if (dirs.length == 1 && maxAngleDiff != null) {
@@ -1972,27 +2006,140 @@ class _HomePageState extends State<HomePage> {
       }
     }
 
-    // FIX BUG 4: Deduplicate by coordinate proximity
+    // Deduplicate by coordinate proximity
     final deduped = _deduplicateJunctions(allJunctions);
 
     final allTurns = deduped
       ..sort((a, b) => (a['distance'] as double).compareTo(b['distance'] as double));
 
-    _turnDebug.phase1EarlyReturned = false; // FIX BUG 1: no early return
-    _turnDebug.detectResult = allTurns.isNotEmpty ? allTurns.first : {"exists": false, "distance": null};
-    _turnDebug.turnExists = allTurns.isNotEmpty;
-    _turnDebug.turnType = allTurns.isNotEmpty ? allTurns.first['type']?.toString() : null;
-    _turnDebug.turnDistance = allTurns.isNotEmpty ? allTurns.first['distance']?.toDouble() : null;
-    _turnDebug.allJunctionsCount = allJunctions.length;
-    _turnDebug.dedupedJunctionsCount = deduped.length;
-    _turnDebug.filteredJunctionsCount = deduped.length;
-    _turnDebug.finalTurns = allTurns;
+    // ─── Cone filter: keep only turns within 60° forward cone ───
+    final heading = _lastHeading ?? 0;
+    final coneFiltered = allTurns.where((t) => _isInCone(
+      lat, lon, heading,
+      t['intersectionLat'] as double,
+      t['intersectionLng'] as double,
+      60.0,
+      scanRadius,
+    )).toList();
 
-    if (allTurns.isNotEmpty) {
-      debugPrint('🚧 ${allTurns.length} turn(s) ahead: ${allTurns.map((t) => '${t['type']} @ ${(t['distance'] as double).toStringAsFixed(1)}m').join(', ')}');
+    // ─── Phase 2: Bend detection on the best way ───
+    _turnDebug.phase2Executed = true;
+    _turnDebug.bendThreshold = 30.0;
+    _turnDebug.phase2Entries.clear();
+    final List<Map<String, dynamic>> bendResults = [];
+
+    if (bestWay != null && bestWay['geometry'] != null) {
+      final bestGeom = bestWay['geometry'] as List<dynamic>;
+      if (bestGeom.length >= 3) {
+        final bestPts = bestGeom
+            .map((p) => LatLng(p['lat'] as double, p['lon'] as double))
+            .toList();
+
+        int segCount = 0;
+        double maxAngle = 0;
+
+        // Scan in the direction of travel from current position
+        final forward = bestGoingForward ?? true;
+        final int iStart, iEnd, iStep;
+        if (forward) {
+          iStart = bestSegmentIndex;
+          iEnd = bestPts.length - 2; // need pts[i], pts[i+1], pts[i+2] valid
+          iStep = 1;
+        } else {
+          // Backward: bend at pts[i+1] = pts[segIdx] is first ahead
+          iStart = bestSegmentIndex > 0 ? bestSegmentIndex - 1 : 0;
+          iEnd = 1; // minimum i for pts[i], pts[i+1], pts[i+2]
+          iStep = -1;
+        }
+
+        for (int i = iStart; forward ? i < iEnd : i > iEnd; i += iStep) {
+          final d = _distance(lat, lon, bestPts[i + 1].latitude, bestPts[i + 1].longitude);
+          if (d > scanRadius) break;
+
+          final b1 = _bearing(bestPts[i], bestPts[i + 1]);
+          final b2 = _bearing(bestPts[i + 1], bestPts[i + 2]);
+          double angleChange = (b2 - b1) % 360;
+          if (angleChange > 180) angleChange -= 360;
+          final absAngle = angleChange.abs();
+          segCount++;
+
+          if (absAngle > maxAngle) maxAngle = absAngle;
+
+          final aboveThreshold = absAngle > (_turnDebug.bendThreshold ?? 30.0);
+          _turnDebug.phase2Entries.add(Phase2Entry(
+            segmentIndex: i,
+            distance: d,
+            bearing1: b1,
+            bearing2: b2,
+            angleChange: absAngle,
+            aboveThreshold: aboveThreshold,
+          ));
+
+          if (aboveThreshold) {
+            final bendDir = angleChange > 0 ? "right" : "left";
+            String bendType;
+            if (absAngle > 90) {
+              bendType = "sharp_${bendDir}_bend";
+            } else if (absAngle > 60) {
+              bendType = "moderate_${bendDir}_bend";
+            } else {
+              bendType = "gentle_${bendDir}_bend";
+            }
+            bendResults.add({
+              "exists": true,
+              "type": bendType,
+              "distance": d,
+              "angle": absAngle,
+              "intersectionLat": bestPts[i + 1].latitude,
+              "intersectionLng": bestPts[i + 1].longitude,
+              "directions": [bendDir],
+              "approachBearing": b1,
+              "roads": [bestWay['id']],
+              "roadId": bestWay['id'],
+              "isBend": true,
+            });
+          }
+        }
+
+        _turnDebug.segmentsWithinRadius = segCount;
+        _turnDebug.maxAngleChange = maxAngle;
+        _turnDebug.bendDetected = bendResults.isNotEmpty;
+        _turnDebug.phase2Result = bendResults.isNotEmpty
+            ? '${bendResults.length} bend(s) found'
+            : 'no bends';
+      } else {
+        _turnDebug.segmentsWithinRadius = 0;
+        _turnDebug.maxAngleChange = 0;
+        _turnDebug.bendDetected = false;
+        _turnDebug.phase2Result = 'insufficient points (< 3)';
+      }
+    } else {
+      _turnDebug.segmentsWithinRadius = 0;
+      _turnDebug.maxAngleChange = 0;
+      _turnDebug.bendDetected = false;
+      _turnDebug.phase2Result = 'no best way';
     }
 
-    return allTurns;
+    // Merge Phase 1 (cone-filtered) and Phase 2 (bend) results, deduplicate, sort
+    final mergedTurns = [...coneFiltered, ...bendResults];
+    final merged = _deduplicateJunctions(mergedTurns);
+    merged.sort((a, b) => (a['distance'] as double).compareTo(b['distance'] as double));
+
+    _turnDebug.phase1EarlyReturned = false;
+    _turnDebug.detectResult = merged.isNotEmpty ? merged.first : {"exists": false, "distance": null};
+    _turnDebug.turnExists = merged.isNotEmpty;
+    _turnDebug.turnType = merged.isNotEmpty ? merged.first['type']?.toString() : null;
+    _turnDebug.turnDistance = merged.isNotEmpty ? merged.first['distance']?.toDouble() : null;
+    _turnDebug.allJunctionsCount = allJunctions.length;
+    _turnDebug.dedupedJunctionsCount = deduped.length;
+    _turnDebug.filteredJunctionsCount = coneFiltered.length;
+    _turnDebug.finalTurns = merged;
+
+    if (merged.isNotEmpty) {
+      debugPrint('🚧 ${merged.length} turn(s) ahead: ${merged.map((t) => '${t['type']} @ ${(t['distance'] as double).toStringAsFixed(1)}m').join(', ')}');
+    }
+
+    return merged;
   }
 
   // Helper function to calculate distance from a point to a line segment
@@ -2064,19 +2211,18 @@ class _HomePageState extends State<HomePage> {
 
       if (mounted) {
         setState(() {
-          if (turns.isNotEmpty && _turnMarkerPosition == null) {
-            final t = turns.first;
-            _turnMarkerPosition = LatLng(
-              (t['intersectionLat'] as num).toDouble(),
-              (t['intersectionLng'] as num).toDouble(),
-            );
-            _turnMarkerType = t['type']?.toString() ?? 'TURN';
-            _minDistToTurn = _distance(
-              _turnMarkerPosition!.latitude, _turnMarkerPosition!.longitude,
-              _fusedPosition!.latitude, _fusedPosition!.longitude,
-            );
+          if (turns.isNotEmpty) {
+            for (final t in turns) {
+              final lat = (t['intersectionLat'] as num).toDouble();
+              final lng = (t['intersectionLng'] as num).toDouble();
+              final key = '${lat.toStringAsFixed(5)},${lng.toStringAsFixed(5)}';
+              if (!_crossedTurnKeys.contains(key) && t['_minDist'] == null) {
+                t['_minDist'] = _distance(lat, lng,
+                    _fusedPosition!.latitude, _fusedPosition!.longitude);
+              }
+            }
           }
-          _turnDetectionMarkers = _buildTurnMarkers(turns.isNotEmpty ? turns.first : null);
+          _turnDetectionMarkers = _buildTurnMarkers(turns);
         });
       }
     } catch (e) {
@@ -2573,7 +2719,7 @@ class _HomePageState extends State<HomePage> {
                       ),
                   ),
                 // ─── Turn/junction info card at bottom ───
-                if (_primaryTurn != null)
+                if (_showTurnPanel && _primaryTurn != null)
                   Positioned(
                     bottom: 8,
                     left: 16,
@@ -2634,7 +2780,7 @@ class _HomePageState extends State<HomePage> {
                     ),
                   ),
                 // ─── Upcoming turns list (from backend cone query) ───
-                if (_upcomingTurns.isNotEmpty)
+                if (_showTurnPanel && _upcomingTurns.isNotEmpty)
                   Positioned(
                     bottom: 80,
                     left: 16,
@@ -2740,7 +2886,7 @@ class _HomePageState extends State<HomePage> {
                     ),
                   ),
                 // ─── Frontend-detected additional turns (2nd, 3rd) ───
-                if (_detectedTurns.length > 1)
+                if (_showTurnPanel && _detectedTurns.length > 1)
                   Positioned(
                     bottom: 80,
                     left: 16,
@@ -2815,6 +2961,47 @@ class _HomePageState extends State<HomePage> {
                       ),
                     ),
                   ),
+                // ─── Turn panel toggle button ───
+                Positioned(
+                  bottom: 8,
+                  left: 0,
+                  right: 0,
+                  child: Center(
+                    child: GestureDetector(
+                      onTap: () => setState(() => _showTurnPanel = !_showTurnPanel),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                        decoration: BoxDecoration(
+                          color: _showTurnPanel ? Colors.white.withOpacity(0.9) : Colors.orange.withOpacity(0.9),
+                          borderRadius: BorderRadius.circular(16),
+                          border: Border.all(color: _showTurnPanel ? Colors.grey : Colors.orange, width: 1.5),
+                          boxShadow: [
+                            BoxShadow(color: Colors.black.withOpacity(0.3), blurRadius: 6),
+                          ],
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              _showTurnPanel ? Icons.visibility_off : Icons.turn_left,
+                              color: _showTurnPanel ? Colors.black87 : Colors.white,
+                              size: 16,
+                            ),
+                            const SizedBox(width: 6),
+                            Text(
+                              _showTurnPanel ? 'HIDE TURNS' : 'SHOW TURNS',
+                              style: TextStyle(
+                                color: _showTurnPanel ? Colors.black87 : Colors.white,
+                                fontSize: 11,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
               ],
             ),
     );
