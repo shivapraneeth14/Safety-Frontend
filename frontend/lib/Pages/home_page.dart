@@ -21,6 +21,72 @@ import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 
+// ─── Pure helper functions for turn detection ───
+
+/// FIX DRAWBACK 3: Maps turn angle (0-180) to risk level 0-5
+int getRiskLevelFromAngle(double angleDeg) {
+  final a = angleDeg.abs();
+  if (a < 15) return 0;
+  if (a < 30) return 1;
+  if (a < 60) return 2;
+  if (a < 90) return 3;
+  if (a < 150) return 4;
+  return 5;
+}
+
+/// FIX DRAWBACK 3: Maps risk level to alert distance in meters
+double getAlertDistanceFromRisk(int riskLevel) {
+  switch (riskLevel) {
+    case 0: return 0;
+    case 1: return 30;
+    case 2: return 50;
+    case 3: return 80;
+    case 4: return 120;
+    case 5: return 160;
+    default: return 50;
+  }
+}
+
+/// FIX DRAWBACK 1: Classifies junction type from complete direction set
+/// Uses ALL roads at a node, not just one road's perspective
+String classifyJunctionType(Set<String> dirs, int totalRoadsAtNode, bool hasStraight, double? maxAngleDiff) {
+  if (dirs.contains("straight") && dirs.length >= 3) {
+    return "cross";
+  }
+  if (!dirs.contains("straight") && dirs.length >= 2) {
+    if (dirs.contains("left") && dirs.contains("right") && totalRoadsAtNode <= 4) {
+      return "y_junction";
+    }
+    return "t_junction";
+  }
+  if (dirs.length == 1 && dirs.contains("straight")) {
+    return "straight";
+  }
+  if (dirs.length == 1 && maxAngleDiff != null) {
+    final absAngle = maxAngleDiff.abs();
+    final dir = maxAngleDiff > 0 ? "right" : "left";
+    if (absAngle > 150) return "hairpin_$dir";
+    if (absAngle > 90) return "sharp_$dir";
+    if (absAngle > 30) return "${dir}_turn";
+    return "slight_$dir";
+  }
+  return "complex";
+}
+
+/// Normalize angle to 0-360 range
+double normalizeAngleDeg(double a) {
+  final n = a % 360;
+  return n < 0 ? n + 360 : n;
+}
+
+/// Calculate angle between two bearings (normalized 0-180)
+double calculateTurnAngle(double approachBearing, double exitBearing) {
+  double diff = (exitBearing - approachBearing) % 360;
+  if (diff > 180) diff -= 360;
+  if (diff < -180) diff += 360;
+  return diff.abs();
+}
+
 class KalmanFilter {
   double lat, lon, vLat, vLon;
   double p00, p01, p10, p11;
@@ -303,6 +369,20 @@ class _HomePageState extends State<HomePage> {
   List<Map<String, dynamic>> _upcomingTurns = [];
   Map<String, dynamic>? _currentRoadInfo;
 
+  // FIX DRAWBACK 6: Emergency cache for network failure
+  List<Map<String, dynamic>>? _emergencyRoadCache;
+  LatLng? _emergencyCachePosition;
+  DateTime? _emergencyCacheTime;
+  String _turnDetectionStatus = 'no_data'; // 'fresh', 'cached', 'limited', 'no_data'
+
+  // Part 3: Backend pre-computed turn markers on map
+  List<Marker> _backendTurnMarkers = [];
+
+  // Part 4: Two-check multi-vehicle collision verification
+  double _turnDetectionConfidence = 0.0;
+  int _multiVehicleRisk = 0;
+  int _vehiclesAtTurn = 0;
+
   @override
   void initState() {
     super.initState();
@@ -535,15 +615,84 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  // Part 3: Build markers from backend pre-computed turns (using lat/lng keys)
+  List<Marker> _buildBackendTurnMarkers(List<Map<String, dynamic>> turns) {
+    if (turns.isEmpty) return [];
+    final heading = _lastHeading ?? 0;
+    final originLat = _fusedPosition?.latitude ?? 0;
+    final originLng = _fusedPosition?.longitude ?? 0;
+    return turns.where((t) {
+      final tLat = (t['lat'] as num).toDouble();
+      final tLng = (t['lng'] as num).toDouble();
+      return _isInCone(originLat, originLng, heading, tLat, tLng, 60.0, 200);
+    }).map((t) {
+      final lat = (t['lat'] as num).toDouble();
+      final lng = (t['lng'] as num).toDouble();
+      final type = t['type'] as String? ?? 'TURN';
+      final dist = (t['distance'] as num?)?.toDouble() ?? 0;
+      final riskLevel = t['riskLevel'] as int? ?? 1;
+      final isBlind = t['blind'] as bool? ?? false;
+      final vehiclesHere = t['vehiclesNearby'] as bool? ?? false;
+      final key = 'backend_${lat.toStringAsFixed(5)},${lng.toStringAsFixed(5)}';
+      if (_crossedTurnKeys.contains(key)) return null;
+
+      Color bgColor;
+      if (vehiclesHere && isBlind) {
+        bgColor = Colors.red.shade900;
+      } else if (riskLevel >= 4) {
+        bgColor = Colors.red.shade700;
+      } else if (riskLevel >= 2) {
+        bgColor = Colors.orange.shade800;
+      } else {
+        bgColor = Colors.blue.shade800;
+      }
+
+      return Marker(
+        point: LatLng(lat, lng),
+        width: 100,
+        height: 30,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+          decoration: BoxDecoration(
+            color: bgColor,
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: Colors.white70, width: 1.5),
+            boxShadow: [
+              BoxShadow(color: Colors.black.withOpacity(0.4), blurRadius: 4),
+            ],
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(_buildTurnIcon(type), color: Colors.white, size: 14),
+              const SizedBox(width: 4),
+              Text(
+                '${type.toUpperCase()} ${dist.toStringAsFixed(0)}m',
+                style: const TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.bold),
+              ),
+              if (vehiclesHere)
+                const Padding(
+                  padding: EdgeInsets.only(left: 4),
+                  child: Icon(Icons.directions_car, color: Colors.yellow, size: 11),
+                ),
+            ],
+          ),
+        ),
+      );
+    }).whereType<Marker>().toList();
+  }
+
   List<Marker> _buildTurnMarkers(List<Map<String, dynamic>> turns) {
     final markers = <Marker>[];
     for (final turn in turns) {
-      final lat = (turn['intersectionLat'] as num).toDouble();
-      final lng = (turn['intersectionLng'] as num).toDouble();
+      // FIX: Handle both frontend (intersectionLat/Lng) and backend (lat/lng) formats
+      final lat = (turn['intersectionLat'] as num?)?.toDouble() ?? (turn['lat'] as num?)?.toDouble() ?? 0;
+      final lng = (turn['intersectionLng'] as num?)?.toDouble() ?? (turn['lng'] as num?)?.toDouble() ?? 0;
+      if (lat == 0 && lng == 0) continue;
       final type = turn['type']?.toString() ?? 'TURN';
       final dist = (turn['distance'] as num).toDouble();
       final key = '${lat.toStringAsFixed(5)},${lng.toStringAsFixed(5)}';
-      if (_crossedTurnKeys.contains(key)) continue;
+      final isCrossed = _crossedTurnKeys.contains(key);
 
       final isBend = type == 'left_bend' || type == 'right_bend';
       final bgColor = isBend ? Colors.red.shade700 : Colors.orange.shade800;
@@ -553,30 +702,33 @@ class _HomePageState extends State<HomePage> {
         point: LatLng(lat, lng),
         width: 100,
         height: 30,
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
-          decoration: BoxDecoration(
-            color: bgColor,
-            borderRadius: BorderRadius.circular(8),
-            border: Border.all(color: Colors.black87, width: 1.5),
-            boxShadow: [
-              BoxShadow(color: Colors.black.withOpacity(0.4), blurRadius: 4),
-            ],
-          ),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(icon, color: Colors.white, size: 14),
-              const SizedBox(width: 4),
-              Text(
-                '${type.toUpperCase()} ${dist.toStringAsFixed(0)}m',
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 10,
-                  fontWeight: FontWeight.bold,
+        child: Opacity(
+          opacity: isCrossed ? 0.3 : 1.0,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+            decoration: BoxDecoration(
+              color: bgColor,
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: Colors.black87, width: 1.5),
+              boxShadow: [
+                BoxShadow(color: Colors.black.withOpacity(0.4), blurRadius: 4),
+              ],
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(icon, color: Colors.white, size: 14),
+                const SizedBox(width: 4),
+                Text(
+                  '${type.toUpperCase()} ${dist.toStringAsFixed(0)}m',
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 10,
+                    fontWeight: FontWeight.bold,
+                  ),
                 ),
-              ),
-            ],
+              ],
+            ),
           ),
         ),
       ));
@@ -585,10 +737,21 @@ class _HomePageState extends State<HomePage> {
   }
 
   void _checkTurnCrossed() {
-    if (_fusedPosition == null || _detectedTurns.isEmpty) return;
-    for (final turn in _detectedTurns) {
-      final lat = (turn['intersectionLat'] as num).toDouble();
-      final lng = (turn['intersectionLng'] as num).toDouble();
+    // FIX: Check both frontend detected turns and backend upcoming turns
+    final allActiveTurns = <Map<String, dynamic>>[
+      ..._detectedTurns,
+      ..._upcomingTurns.map((t) => {
+        'intersectionLat': t['lat'],
+        'intersectionLng': t['lng'],
+        'distance': t['distance']?.toDouble() ?? 0,
+        '_backend': true,
+      }),
+    ];
+    if (_fusedPosition == null || allActiveTurns.isEmpty) return;
+    for (final turn in allActiveTurns) {
+      final lat = (turn['intersectionLat'] as num?)?.toDouble() ?? 0;
+      final lng = (turn['intersectionLng'] as num?)?.toDouble() ?? 0;
+      if (lat == 0 && lng == 0) continue;
       final key = '${lat.toStringAsFixed(5)},${lng.toStringAsFixed(5)}';
       if (_crossedTurnKeys.contains(key)) continue;
       final d = _distance(lat, lng, _fusedPosition!.latitude, _fusedPosition!.longitude);
@@ -599,12 +762,15 @@ class _HomePageState extends State<HomePage> {
         if (d < prev) turn['_minDist'] = d;
         if (prev < 10.0 && d > 25.0) {
           _crossedTurnKeys.add(key);
+          // Also add backend variant of the key
+          _crossedTurnKeys.add('backend_$key');
         }
       }
     }
     if (mounted) {
       setState(() {
         _turnDetectionMarkers = _buildTurnMarkers(_detectedTurns);
+        _backendTurnMarkers = _buildBackendTurnMarkers(_upcomingTurns);
       });
     }
   }
@@ -975,6 +1141,41 @@ class _HomePageState extends State<HomePage> {
         if (mounted) {
           setState(() {
             _upcomingTurns = turns;
+          });
+        }
+
+        // Part 3: Build map markers from backend pre-computed database turns
+        final backendMarkers = _buildBackendTurnMarkers(turns);
+        if (mounted) {
+          setState(() {
+            _backendTurnMarkers = backendMarkers;
+          });
+        }
+
+        // Part 4: Two-check verification — cross-reference frontend detection with backend DB
+        // FIX: Compute detection confidence by matching frontend-detected turns against backend
+        if (mounted) {
+          final confidence = _computeTurnDetectionConfidence(_primaryTurn, turns);
+          final multiRisk = _assessMultiVehicleRisk(turns, _activeThreats, _lastSpeed ?? 0);
+          int vehiclesHere = 0;
+          if (_primaryTurn != null) {
+            final pLat = (_primaryTurn!['intersectionLat'] as num?)?.toDouble() ?? 0;
+            final pLng = (_primaryTurn!['intersectionLng'] as num?)?.toDouble() ?? 0;
+            if (pLat != 0) {
+              for (final t in turns) {
+                final tLat = (t['lat'] as num).toDouble();
+                final tLng = (t['lng'] as num).toDouble();
+                if (_distance(tLat, tLng, pLat, pLng) < 20) {
+                  vehiclesHere = t['vehicleCount'] as int? ?? 0;
+                  break;
+                }
+              }
+            }
+          }
+          setState(() {
+            _turnDetectionConfidence = confidence;
+            _multiVehicleRisk = multiRisk;
+            _vehiclesAtTurn = vehiclesHere;
           });
         }
       }
@@ -1521,21 +1722,25 @@ class _HomePageState extends State<HomePage> {
         return;
       }
 
-      // Faster speed = more frequent checks
+      // FIX DRAWBACK 4: Faster, speed-adaptive intervals
+      // REASON: At 60km/h, old 3s interval allowed 50m travel between checks
+      // EXPECTED: At 60km/h → check every 2s or 20m, scan 200m radius
       final speed = _lastSpeed ?? 0;
       int minSeconds;
+      double minDistance;
       if (speed > 13.9) {        // > 50 km/h
-        minSeconds = 3;
+        minSeconds = 2;
+        minDistance = 20;
       } else if (speed > 8.3) {  // > 30 km/h
-        minSeconds = 5;
+        minSeconds = 4;
+        minDistance = 20;
       } else if (speed > 4.2) {  // > 15 km/h
-        minSeconds = 8;
+        minSeconds = 6;
+        minDistance = 20;
       } else {
-        minSeconds = 15;
+        minSeconds = 10;
+        minDistance = 20;
       }
-
-      // Check every 25m moved (half of minimum scan range)
-      const double minDistance = 25.0;
 
       if (_lastTurnCheckTime != null) {
         final dt = now.difference(_lastTurnCheckTime!).inMilliseconds;
@@ -1556,7 +1761,7 @@ class _HomePageState extends State<HomePage> {
         _turnDebug.minDistanceM = minDistance;
         _turnDebug.shouldRun = !(dt < minSeconds * 1000 && moved < minDistance);
 
-        // OR condition — check if EITHER enough time passed OR enough distance moved
+        // OR condition: fire if EITHER enough time OR enough distance (skip only if BOTH below)
         if (dt < minSeconds * 1000 && moved < minDistance) {
           _turnDebug.skipReason = 'time=${(dt/1000).toStringAsFixed(1)}s < ${minSeconds}s AND dist=${moved.toStringAsFixed(1)}m < ${minDistance}m';
           return;
@@ -1612,9 +1817,13 @@ class _HomePageState extends State<HomePage> {
   }
 
   double _getScanRadius() {
+    // FIX DRAWBACK 4: Speed-based scan radius with 200m cap
+    // REASON: 150m max was too short for 60km/h (16.7m/s * 10s = 167m)
+    // EXPECTED: At 60km/h → 200m radius detects junction 10s+ before arrival
     final speed = _lastSpeed ?? 0;
-    if (speed > 13.9) return 150;   // > 50 km/h
-    if (speed > 8.3)  return 100;   // > 30 km/h
+    if (speed > 13.9) return 200;   // > 50 km/h → 200m
+    if (speed > 8.3)  return 150;   // > 30 km/h → 150m
+    if (speed > 4.2)  return 100;   // > 15 km/h → 100m
     return 60;                      // slow speed
   }
 
@@ -1683,15 +1892,43 @@ class _HomePageState extends State<HomePage> {
       _turnDebug.httpError = e.toString();
       _turnDebug.roadsReturned = null;
       debugPrint('⚠️ Nearby roads query failed: $e');
+
+      // FIX DRAWBACK 6A: Try emergency cache before giving up
+      // REASON: Network failure should not silently kill detection
+      // EXPECTED: Uses last known road data for 5 min / 200m
+      if (_emergencyRoadCache != null && _emergencyCacheTime != null) {
+        final ageSec = DateTime.now().difference(_emergencyCacheTime!).inSeconds;
+        final distM = _emergencyCachePosition != null
+            ? _distance(lat, lon, _emergencyCachePosition!.latitude, _emergencyCachePosition!.longitude)
+            : double.infinity;
+        if (ageSec < 300 && distM < 200) {
+          _turnDebug.fallbackUsed = true;
+          _turnDetectionStatus = 'cached';
+          debugPrint('🗺️ Emergency cache fallback (age=${ageSec}s, dist=${distM.toStringAsFixed(0)}m)');
+          return _processTurnDataFromElements(_emergencyRoadCache!, lat, lon, scanRadius);
+        }
+      }
+
+      // FIX DRAWBACK 6B: Then try primary cache
       if (_cachedRoadData != null && _cachedRoadData!.isNotEmpty) {
         _turnDebug.fallbackUsed = true;
+        _turnDetectionStatus = 'cached';
         debugPrint('🗺️ Falling back to cached road data');
         return _processTurnDataFromElements(_cachedRoadData!, lat, lon, scanRadius);
       }
+
+      _turnDetectionStatus = 'limited';
+      debugPrint('⚠️ No cache available — turn detection limited');
       return [];
     }
 
     if (data != null && data['elements'] != null && (data['elements'] as List).isNotEmpty) {
+      // FIX DRAWBACK 6C: Store successful fetch as emergency cache
+      _emergencyRoadCache = List.from(data['elements']);
+      _emergencyCachePosition = _fusedPosition;
+      _emergencyCacheTime = DateTime.now();
+      _turnDetectionStatus = 'fresh';
+
       _cachedRoadData = List.from(data['elements']);
       _cachedRoadDataTime = DateTime.now();
       _lastRoadFetchPosition = _fusedPosition;
@@ -1702,9 +1939,11 @@ class _HomePageState extends State<HomePage> {
     debugPrint('⚠️ No roads found nearby');
     if (_cachedRoadData != null && _cachedRoadData!.isNotEmpty) {
       _turnDebug.fallbackUsed = true;
+      _turnDetectionStatus = 'cached';
       debugPrint('🗺️ Falling back to cached road data');
       return _processTurnDataFromElements(_cachedRoadData!, lat, lon, scanRadius);
     }
+    _turnDetectionStatus = 'limited';
     return [];
   }
 
@@ -1831,7 +2070,6 @@ class _HomePageState extends State<HomePage> {
           .toList();
 
       // Defensive: skip roads where nodes/geometry length mismatch
-      // (ensures nodes[j] and pts[j] correspond 1:1)
       if (nodes.length != pts.length) {
         debugPrint('⚠️ Road $roadId: nodes(${nodes.length}) != geometry(${pts.length}) — skipping');
         continue;
@@ -1843,7 +2081,10 @@ class _HomePageState extends State<HomePage> {
         final d = _distanceToSegment(lat, lon, pts[i], pts[i + 1]);
         if (d < minSegDist) { minSegDist = d; segIdx = i; }
       }
-      if (minSegDist > 50) continue;
+      // FIX DRAWBACK 1: Use scanRadius instead of hardcoded 50
+      // REASON: 50m skip caused roads at crossroad to be ignored
+      // EXPECTED: All roads within scanRadius contribute to junction classification
+      if (minSegDist > scanRadius) continue;
 
       final segBearing = _bearing(pts[segIdx], pts[segIdx + 1]);
       double hdgDiff = (_lastHeading ?? segBearing) - segBearing;
@@ -1852,8 +2093,6 @@ class _HomePageState extends State<HomePage> {
       final goingForward = hdgDiff.abs() <= 90;
 
       // nodes.length == pts.length guaranteed by check above
-      final scanLimit = goingForward ? pts.length : 0;
-      final scanStep = goingForward ? 1 : -1;
 
       if (roadId == bestWay?['id']) {
         _turnDebug.goingForward = goingForward;
@@ -1864,14 +2103,13 @@ class _HomePageState extends State<HomePage> {
         bestGoingForward = goingForward;
       }
 
-      // Fix: start scan at closest segment index (not segIdx+1 for backward)
-      final scanStart = segIdx;
-
-      for (int j = scanStart;
-          goingForward ? j < scanLimit : j >= scanLimit;
-          j += scanStep) {
+      // FIX DRAWBACK 2: Explicit forward/backward loops
+      // REASON: Old loop with scanStart/scanLimit/scanStep had off-by-one errors
+      // for short roads and segIdx=0 backward cases
+      // EXPECTED: All nodes within scanRadius are scanned regardless of road length
+      void scanNode(int j) {
         final dist = _distance(lat, lon, pts[j].latitude, pts[j].longitude);
-        if (dist > scanRadius) break;
+        if (dist > scanRadius) return;
 
         final nodeId = nodes[j] as int;
         final waysHere = nodeToWays[nodeId] ?? [];
@@ -1887,12 +2125,9 @@ class _HomePageState extends State<HomePage> {
           ));
         }
 
-        if (!isJunction) continue;
+        if (!isJunction) return;
 
-        // Fix: approach bearing with proper edge case handling
-        // Forward: bearing from previous point to this junction
-        // Backward: bearing from next point to this junction
-        // At road ends, fall back to segment bearing
+        // Approach bearing with proper edge case handling
         final approach = goingForward
             ? (j > 0 ? _bearing(pts[j - 1], pts[j]) : segBearing)
             : (j + 1 < pts.length ? _bearing(pts[j + 1], pts[j]) : (segBearing + 180) % 360);
@@ -1949,34 +2184,13 @@ class _HomePageState extends State<HomePage> {
         final dirs = Set<String>.from(sideRoads);
         if (hasStraight) dirs.add("straight");
 
-        // FIX BUG 5: Angle-based classification
-        String type;
-        if (dirs.contains("straight") && dirs.length >= 3) {
-          type = "cross";
-        } else if (!dirs.contains("straight") && dirs.length >= 2) {
-          // Y-junction: road forks into two different directions
-          if (sideRoads.contains("left") && sideRoads.contains("right") && waysHere.length <= 4) {
-            type = "y_junction";
-          } else {
-            type = "t_junction";
-          }
-        } else if (dirs.length == 1 && dirs.contains("straight")) {
-          continue;
-        } else if (dirs.length == 1 && maxAngleDiff != null) {
-          final absAngle = maxAngleDiff.abs();
-          final dir = maxAngleDiff > 0 ? "right" : "left";
-          if (absAngle > 150) {
-            type = "hairpin_$dir";
-          } else if (absAngle > 90) {
-            type = "sharp_$dir";
-          } else if (absAngle > 30) {
-            type = "${dir}_turn";
-          } else {
-            type = "slight_$dir";
-          }
-        } else {
-          continue;
-        }
+        // FIX DRAWBACK 1: Use pure function with complete direction set
+        // FIX DRAWBACK 3: Add riskLevel from angle
+        final type = classifyJunctionType(dirs, waysHere.length, hasStraight, maxAngleDiff);
+        if (type == "straight") return;
+
+        final riskLevel = getRiskLevelFromAngle(maxAngleDiff ?? 0);
+        final alertDistanceM = getAlertDistanceFromRisk(riskLevel);
 
         if (roadId == bestWay?['id']) {
           _turnDebug.phase1Entries.last.junctionType = type;
@@ -2000,9 +2214,32 @@ class _HomePageState extends State<HomePage> {
           "approachBearing": approach,
           "roads": waysHere,
           "roadId": roadId,
+          "riskLevel": riskLevel,
+          "alertDistanceM": alertDistanceM,
         });
 
-        debugPrint('🚧 Junction found: $type at ${dist.toStringAsFixed(1)}m on road $roadId');
+        debugPrint('🚧 Junction found: $type (risk=$riskLevel) at ${dist.toStringAsFixed(1)}m on road $roadId');
+      }
+
+      if (goingForward) {
+        for (int j = segIdx; j < pts.length; j++) {
+          scanNode(j);
+        }
+        // FIX DRAWBACK 2: Also scan behind segIdx on the best road for short roads
+        if (roadId == bestWay?['id']) {
+          for (int j = segIdx - 1; j >= 0; j--) {
+            scanNode(j);
+          }
+        }
+      } else {
+        // FIX DRAWBACK 2: Backward scan covers all indices including 0
+        for (int j = segIdx; j >= 0; j--) {
+          scanNode(j);
+        }
+        // FIX DRAWBACK 2: Also scan the other endpoint of closest segment for short roads
+        if (segIdx + 1 < pts.length) {
+          scanNode(segIdx + 1);
+        }
       }
     }
 
@@ -2043,13 +2280,13 @@ class _HomePageState extends State<HomePage> {
         final int iStart, iEnd, iStep;
         if (forward) {
           iStart = bestSegmentIndex;
-          iEnd = bestPts.length - 2; // need pts[i], pts[i+1], pts[i+2] valid
+          iEnd = bestPts.length - 2;
           iStep = 1;
         } else {
-          // Backward: bend at pts[i+1] = pts[segIdx] is first ahead
           iStart = bestSegmentIndex > 0 ? bestSegmentIndex - 1 : 0;
-          iEnd = 1; // minimum i for pts[i], pts[i+1], pts[i+2]
+          iEnd = 1;
           iStep = -1;
+          // FIX DRAWBACK 2: Also scan forward end for short roads in backward mode
         }
 
         for (int i = iStart; forward ? i < iEnd : i > iEnd; i += iStep) {
@@ -2076,6 +2313,17 @@ class _HomePageState extends State<HomePage> {
           ));
 
           if (aboveThreshold) {
+            final bendLat = bestPts[i + 1].latitude;
+            final bendLng = bestPts[i + 1].longitude;
+
+            // FIX DRAWBACK 5: 60° cone filter for bends
+            // REASON: Bends behind vehicle were reported as upcoming
+            // EXPECTED: Only bends ahead in travel direction are reported
+            if (!_isInCone(lat, lon, heading, bendLat, bendLng, 60.0, scanRadius)) {
+              debugPrint('🗺️ Bend behind vehicle skipped: ${absAngle.toStringAsFixed(0)}° at ${d.toStringAsFixed(0)}m');
+              continue;
+            }
+
             final bendDir = angleChange > 0 ? "right" : "left";
             String bendType;
             if (absAngle > 90) {
@@ -2085,19 +2333,70 @@ class _HomePageState extends State<HomePage> {
             } else {
               bendType = "gentle_${bendDir}_bend";
             }
+
+            // FIX DRAWBACK 3: Add riskLevel for bends too
+            final bendRisk = getRiskLevelFromAngle(absAngle);
+            final bendAlertDist = getAlertDistanceFromRisk(bendRisk);
+
             bendResults.add({
               "exists": true,
               "type": bendType,
               "distance": d,
               "angle": absAngle,
-              "intersectionLat": bestPts[i + 1].latitude,
-              "intersectionLng": bestPts[i + 1].longitude,
+              "intersectionLat": bendLat,
+              "intersectionLng": bendLng,
               "directions": [bendDir],
               "approachBearing": b1,
               "roads": [bestWay['id']],
               "roadId": bestWay['id'],
               "isBend": true,
+              "riskLevel": bendRisk,
+              "alertDistanceM": bendAlertDist,
             });
+          }
+        }
+
+        // FIX DRAWBACK 2: For short roads in backward mode, scan forward too
+        if (!forward && bestSegmentIndex + 2 < bestPts.length) {
+          final i = bestSegmentIndex;
+          final d = _distance(lat, lon, bestPts[i + 1].latitude, bestPts[i + 1].longitude);
+          if (d <= scanRadius) {
+            final b1 = _bearing(bestPts[i], bestPts[i + 1]);
+            final b2 = _bearing(bestPts[i + 1], bestPts[i + 2]);
+            double angleChange = (b2 - b1) % 360;
+            if (angleChange > 180) angleChange -= 360;
+            final absAngle = angleChange.abs();
+            if (absAngle > (_turnDebug.bendThreshold ?? 30.0)) {
+              final bendLat = bestPts[i + 1].latitude;
+              final bendLng = bestPts[i + 1].longitude;
+              if (_isInCone(lat, lon, heading, bendLat, bendLng, 60.0, scanRadius)) {
+                final bendDir = angleChange > 0 ? "right" : "left";
+                String bendType;
+                if (absAngle > 90) {
+                  bendType = "sharp_${bendDir}_bend";
+                } else if (absAngle > 60) {
+                  bendType = "moderate_${bendDir}_bend";
+                } else {
+                  bendType = "gentle_${bendDir}_bend";
+                }
+                final bendRisk = getRiskLevelFromAngle(absAngle);
+                bendResults.add({
+                  "exists": true,
+                  "type": bendType,
+                  "distance": d,
+                  "angle": absAngle,
+                  "intersectionLat": bendLat,
+                  "intersectionLng": bendLng,
+                  "directions": [bendDir],
+                  "approachBearing": b1,
+                  "roads": [bestWay['id']],
+                  "roadId": bestWay['id'],
+                  "isBend": true,
+                  "riskLevel": bendRisk,
+                  "alertDistanceM": getAlertDistanceFromRisk(bendRisk),
+                });
+              }
+            }
           }
         }
 
@@ -2136,13 +2435,71 @@ class _HomePageState extends State<HomePage> {
     _turnDebug.finalTurns = merged;
 
     if (merged.isNotEmpty) {
-      debugPrint('🚧 ${merged.length} turn(s) ahead: ${merged.map((t) => '${t['type']} @ ${(t['distance'] as double).toStringAsFixed(1)}m').join(', ')}');
+      debugPrint('🚧 ${merged.length} turn(s) ahead: ${merged.map((t) => '${t['type']} @ ${(t['distance'] as double).toStringAsFixed(1)}m risk=${t['riskLevel']}').join(', ')}');
     }
 
     return merged;
   }
 
-  // Helper function to calculate distance from a point to a line segment
+  // FIX Part 4: Two-check collision verification
+  // Cross-references frontend geometry detection with backend pre-computed database
+  double _computeTurnDetectionConfidence(
+    Map<String, dynamic>? frontendTurn,
+    List<Map<String, dynamic>> backendTurns,
+  ) {
+    if (frontendTurn == null) return 0.0;
+    if (backendTurns.isEmpty) return 0.3;
+
+    final fLat = (frontendTurn['intersectionLat'] as num?)?.toDouble() ?? 0;
+    final fLng = (frontendTurn['intersectionLng'] as num?)?.toDouble() ?? 0;
+    if (fLat == 0 && fLng == 0) return 0.0;
+
+    for (final bt in backendTurns) {
+      final bLat = (bt['lat'] as num).toDouble();
+      final bLng = (bt['lng'] as num).toDouble();
+      final dist = _distance(fLat, fLng, bLat, bLng);
+      if (dist < 15.0) {
+        // Same junction detected by both methods → HIGH confidence
+        return (0.7 + (0.3 * (1.0 - (dist / 15.0)))).clamp(0.7, 1.0);
+      }
+    }
+    return 0.3;
+  }
+
+  // FIX Part 4: Multi-vehicle collision risk assessment
+  // Checks every vehicle near each junction, not just pairwise
+  int _assessMultiVehicleRisk(
+    List<Map<String, dynamic>> backendTurns,
+    List<Map<String, dynamic>> activeThreats,
+    double speedMs,
+  ) {
+    int maxRisk = 0;
+
+    for (final turn in backendTurns) {
+      final vehicleCount = turn['vehicleCount'] as int? ?? 0;
+      final riskLevel = turn['riskLevel'] as int? ?? 1;
+
+      if (vehicleCount >= 3) {
+        maxRisk = maxRisk < 5 ? 5 : maxRisk;
+      } else if (vehicleCount >= 2) {
+        maxRisk = maxRisk < (riskLevel + 1).clamp(1, 5) ? (riskLevel + 1).clamp(1, 5) : maxRisk;
+      } else if (vehicleCount >= 1) {
+        maxRisk = maxRisk < riskLevel ? riskLevel : maxRisk;
+      }
+    }
+
+    final turnCollisionThreats = activeThreats.where((t) =>
+      t['type'] == 'turn_collision' || t['type'] == 'intersection_collision'
+    ).toList();
+
+    if (turnCollisionThreats.length >= 2) {
+      maxRisk = maxRisk < 5 ? 5 : maxRisk;
+    } else if (turnCollisionThreats.length >= 1) {
+      maxRisk = maxRisk < 4 ? 4 : maxRisk;
+    }
+
+    return maxRisk;
+  }
   double _distanceToSegment(
     double lat,
     double lon,
@@ -2482,6 +2839,40 @@ class _HomePageState extends State<HomePage> {
                               ),
                             ),
                           ),
+                          const SizedBox(width: 6),
+                          // FIX DRAWBACK 6D: Turn detection status indicator
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                            decoration: BoxDecoration(
+                              color: _turnDetectionStatus == 'fresh' ? Colors.green
+                                   : _turnDetectionStatus == 'cached' ? Colors.orange
+                                   : Colors.red,
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(
+                                  _turnDetectionStatus == 'fresh' ? Icons.brightness_1
+                                      : _turnDetectionStatus == 'cached' ? Icons.brightness_medium
+                                      : Icons.brightness_2,
+                                  color: Colors.white,
+                                  size: 12,
+                                ),
+                                const SizedBox(width: 2),
+                                Text(
+                                  _turnDetectionStatus == 'fresh' ? 'T'
+                                      : _turnDetectionStatus == 'cached' ? 'T~'
+                                      : 'T!',
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 9,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
                         ],
                       ),
                     ),
@@ -2613,9 +3004,9 @@ class _HomePageState extends State<HomePage> {
                       // Threat markers layer (red dots)
                       if (_threatMarkers.isNotEmpty)
                         MarkerLayer(markers: _threatMarkers),
-                      // Turn debug markers (yellow detection dot + red intersection label)
-                      if (_turnDetectionMarkers.isNotEmpty)
-                        MarkerLayer(markers: _turnDetectionMarkers),
+                      // Part 3: Turn markers — frontend (geometry) + backend (DB) merged
+                      if (_turnDetectionMarkers.isNotEmpty || _backendTurnMarkers.isNotEmpty)
+                        MarkerLayer(markers: [..._turnDetectionMarkers, ..._backendTurnMarkers]),
                     ],
                   ),
                 ),
@@ -2744,10 +3135,37 @@ class _HomePageState extends State<HomePage> {
                         ),
                         child: Row(
                           children: [
-                            Icon(
-                              _buildTurnIcon(_primaryTurn!['type']),
-                              color: Colors.white,
-                              size: 28,
+                            Column(
+                              children: [
+                                Icon(
+                                  _buildTurnIcon(_primaryTurn!['type']),
+                                  color: Colors.white,
+                                  size: 28,
+                                ),
+                                // Part 4: Multi-vehicle indicator below icon
+                                if (_vehiclesAtTurn > 0)
+                                  Padding(
+                                    padding: const EdgeInsets.only(top: 4),
+                                    child: Container(
+                                      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+                                      decoration: BoxDecoration(
+                                        color: Colors.yellow.shade700,
+                                        borderRadius: BorderRadius.circular(6),
+                                      ),
+                                      child: Row(
+                                        mainAxisSize: MainAxisSize.min,
+                                        children: [
+                                          Icon(Icons.directions_car, color: Colors.white, size: 10),
+                                          const SizedBox(width: 2),
+                                          Text(
+                                            '$_vehiclesAtTurn',
+                                            style: const TextStyle(color: Colors.white, fontSize: 9, fontWeight: FontWeight.bold),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                              ],
                             ),
                             const SizedBox(width: 12),
                             Expanded(
@@ -2769,6 +3187,38 @@ class _HomePageState extends State<HomePage> {
                                       style: TextStyle(
                                         color: Colors.white.withOpacity(0.9),
                                         fontSize: 13,
+                                      ),
+                                    ),
+                                  // Part 4: Detection confidence bar
+                                  if (_turnDetectionConfidence > 0)
+                                    Padding(
+                                      padding: const EdgeInsets.only(top: 4),
+                                      child: Row(
+                                        children: [
+                                          Container(
+                                            width: 50,
+                                            height: 4,
+                                            decoration: BoxDecoration(
+                                              color: Colors.white24,
+                                              borderRadius: BorderRadius.circular(2),
+                                            ),
+                                            child: FractionallySizedBox(
+                                              alignment: Alignment.centerLeft,
+                                              widthFactor: _turnDetectionConfidence.clamp(0.0, 1.0),
+                                              child: Container(
+                                                decoration: BoxDecoration(
+                                                  color: _turnDetectionConfidence >= 0.7 ? Colors.greenAccent : Colors.orangeAccent,
+                                                  borderRadius: BorderRadius.circular(2),
+                                                ),
+                                              ),
+                                            ),
+                                          ),
+                                          const SizedBox(width: 4),
+                                          Text(
+                                            '${(_turnDetectionConfidence * 100).toStringAsFixed(0)}%',
+                                            style: const TextStyle(color: Colors.white54, fontSize: 9),
+                                          ),
+                                        ],
                                       ),
                                     ),
                                 ],
@@ -2825,6 +3275,7 @@ class _HomePageState extends State<HomePage> {
                                 final riskLevel = turn['riskLevel'] as int? ?? 1;
                                 final isBlind = turn['blind'] as bool? ?? false;
                                 final vehiclesNearby = turn['vehiclesNearby'] as bool? ?? false;
+                                final vehicleCount = turn['vehicleCount'] as int? ?? 0;
                                 final angle = turn['angle'] as int? ?? 0;
 
                                 // Color code by risk
@@ -2874,6 +3325,29 @@ class _HomePageState extends State<HomePage> {
                                         const Padding(
                                           padding: EdgeInsets.only(left: 4),
                                           child: Icon(Icons.warning, color: Colors.red, size: 14),
+                                        ),
+                                      // Part 4: Multi-vehicle indicator
+                                      if (vehicleCount > 0)
+                                        Padding(
+                                          padding: const EdgeInsets.only(left: 4),
+                                          child: Container(
+                                            padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 1),
+                                            decoration: BoxDecoration(
+                                              color: Colors.yellow.shade800,
+                                              borderRadius: BorderRadius.circular(4),
+                                            ),
+                                            child: Row(
+                                              mainAxisSize: MainAxisSize.min,
+                                              children: [
+                                                const Icon(Icons.directions_car, color: Colors.white, size: 9),
+                                                const SizedBox(width: 2),
+                                                Text(
+                                                  '$vehicleCount',
+                                                  style: const TextStyle(color: Colors.white, fontSize: 9, fontWeight: FontWeight.bold),
+                                                ),
+                                              ],
+                                            ),
+                                          ),
                                         ),
                                     ],
                                   ),
