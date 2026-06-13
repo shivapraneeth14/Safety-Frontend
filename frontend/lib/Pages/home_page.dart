@@ -379,6 +379,11 @@ class _HomePageState extends State<HomePage> {
   // Part 3: Backend pre-computed turn markers on map
   List<Marker> _backendTurnMarkers = [];
 
+  // Road junction cache (full list when entering a road)
+  List<Map<String, dynamic>> _roadJunctions = [];
+  String? _currentRoadId;
+  List<Marker> _roadJunctionMarkers = [];
+
   // Part 4: Two-check multi-vehicle collision verification
   double _turnDetectionConfidence = 0.0;
   int _multiVehicleRisk = 0;
@@ -580,6 +585,24 @@ class _HomePageState extends State<HomePage> {
     // Check if turn marker should be cleared (crossed the turn)
     _checkTurnCrossed();
 
+    // Track crossed junctions from road junction cache
+    if (_roadJunctions.isNotEmpty && _fusedPosition != null) {
+      bool changed = false;
+      for (final j in _roadJunctions) {
+        final key = '${(j['lat'] as num).toStringAsFixed(5)},${(j['lng'] as num).toStringAsFixed(5)}';
+        if (_crossedTurnKeys.contains(key)) continue;
+        final dist = _distance(
+          _fusedPosition!.latitude, _fusedPosition!.longitude,
+          (j['lat'] as num).toDouble(), (j['lng'] as num).toDouble(),
+        );
+        if (dist < 10) {
+          _crossedTurnKeys.add(key);
+          changed = true;
+        }
+      }
+      if (changed) _roadJunctionMarkers = _buildRoadJunctionMarkers();
+    }
+
     setState(() {});
   }
 
@@ -735,6 +758,56 @@ class _HomePageState extends State<HomePage> {
       ));
     }
     return markers;
+  }
+
+  List<Marker> _buildRoadJunctionMarkers() {
+    return _roadJunctions
+      .where((j) => !_crossedTurnKeys.contains(
+        '${(j['lat'] as num).toStringAsFixed(5)},${(j['lng'] as num).toStringAsFixed(5)}'))
+      .map((j) {
+      final lat = (j['lat'] as num).toDouble();
+      final lng = (j['lng'] as num).toDouble();
+      final type = j['type'] as String? ?? 'unknown';
+      final dist = (j['distance'] as num?)?.toDouble() ?? 0;
+      final dirs = j['dirs'] as List? ?? [];
+
+      IconData icon;
+      if (type.contains('left')) icon = Icons.arrow_left;
+      else if (type.contains('right')) icon = Icons.arrow_right;
+      else if (type == 'cross' || dirs.length >= 3) icon = Icons.add;
+      else if (type.contains('sharp')) icon = Icons.turn_left;
+      else icon = Icons.arrow_upward;
+
+      return Marker(
+        point: LatLng(lat, lng),
+        width: 100,
+        height: 30,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+          decoration: BoxDecoration(
+            color: Colors.orange.shade800,
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: Colors.black87, width: 1.5),
+            boxShadow: [
+              BoxShadow(color: Colors.black.withOpacity(0.4), blurRadius: 4),
+            ],
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(icon, color: Colors.white, size: 14),
+              const SizedBox(width: 4),
+              Text(
+                '${type.toUpperCase()} ${dist.toStringAsFixed(0)}m',
+                style: const TextStyle(
+                  color: Colors.white, fontSize: 10, fontWeight: FontWeight.bold,
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }).toList();
   }
 
   void _checkTurnCrossed() {
@@ -1048,6 +1121,18 @@ class _HomePageState extends State<HomePage> {
         final mm = payload['mapMatch'] as Map;
         // Server-snapped position is authoritative
         debugPrint('🗺️ Server map match: road=${mm['roadId']} conf=${(mm['confidence'] * 100).toStringAsFixed(0)}%');
+
+        // When road changes, cache all junctions from backend
+        final newRoadId = mm['roadId'] as String?;
+        if (newRoadId != null && newRoadId != _currentRoadId) {
+          _currentRoadId = newRoadId;
+          _crossedTurnKeys.clear();
+          if (payload['roadJunctions'] is List) {
+            _roadJunctions = (payload['roadJunctions'] as List).cast<Map<String, dynamic>>();
+            _roadJunctionMarkers = _buildRoadJunctionMarkers();
+            if (mounted) setState(() {});
+          }
+        }
       }
 
       // --- Format 1: Direct push from backend: {status: "threat", data: {...}} ---
@@ -2563,6 +2648,11 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _checkTurnAhead() async {
+    // Skip scan when we have cached road junctions from backend
+    if (_roadJunctions.isNotEmpty && _currentRoadId != null) {
+      if (mounted) setState(() {});
+      return;
+    }
     try {
       final now = DateTime.now();
       final turns = await _detectTurnAhead();
@@ -3034,8 +3124,11 @@ class _HomePageState extends State<HomePage> {
                       // Threat markers layer (red dots)
                       if (_threatMarkers.isNotEmpty)
                         MarkerLayer(markers: _threatMarkers),
+                      // Road junction markers (cached full road list)
+                      if (_roadJunctionMarkers.isNotEmpty)
+                        MarkerLayer(markers: _roadJunctionMarkers),
                       // Part 3: Turn markers — frontend (geometry) + backend (DB) merged
-                      if (_turnDetectionMarkers.isNotEmpty || _backendTurnMarkers.isNotEmpty)
+                      if (_roadJunctionMarkers.isEmpty && (_turnDetectionMarkers.isNotEmpty || _backendTurnMarkers.isNotEmpty))
                         MarkerLayer(markers: [..._turnDetectionMarkers, ..._backendTurnMarkers]),
                     ],
                   ),
