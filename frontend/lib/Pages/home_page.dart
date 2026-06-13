@@ -761,9 +761,19 @@ class _HomePageState extends State<HomePage> {
   }
 
   List<Marker> _buildRoadJunctionMarkers() {
+    if (_fusedPosition == null) return [];
+    final originLat = _fusedPosition!.latitude;
+    final originLng = _fusedPosition!.longitude;
+    final heading = _displayHeadingDeg;
+
     return _roadJunctions
       .where((j) => !_crossedTurnKeys.contains(
         '${(j['lat'] as num).toStringAsFixed(5)},${(j['lng'] as num).toStringAsFixed(5)}'))
+      .where((j) => _isInCone(
+        originLat, originLng, heading,
+        (j['lat'] as num).toDouble(), (j['lng'] as num).toDouble(),
+        60.0, 2000,
+      ))
       .map((j) {
       final lat = (j['lat'] as num).toDouble();
       final lng = (j['lng'] as num).toDouble();
