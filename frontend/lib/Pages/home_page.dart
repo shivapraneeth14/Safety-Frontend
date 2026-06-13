@@ -2991,6 +2991,18 @@ class _HomePageState extends State<HomePage> {
                             ),
                           ],
                         ),
+                      // Scan radius circle (speed-adaptive 60-200m)
+                      CircleLayer(
+                        circles: [
+                          CircleMarker(
+                            point: _snappedPosition ?? _currentPosition!,
+                            radius: _getScanRadius().toDouble(),
+                            color: Colors.blue.withValues(alpha: 0.04),
+                            borderColor: Colors.blue.withValues(alpha: 0.2),
+                            borderStrokeWidth: 1.5,
+                          ),
+                        ],
+                      ),
                       if (_nearbyVehicleMarkers.isNotEmpty)
                         MarkerLayer(markers: _nearbyVehicleMarkers),
                       MarkerLayer(
