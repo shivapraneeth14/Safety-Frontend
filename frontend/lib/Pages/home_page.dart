@@ -287,6 +287,8 @@ class _HomePageState extends State<HomePage> {
 
   // Threat markers rendered as red dots
   List<Marker> _threatMarkers = [];
+  // Nearby vehicle markers rendered as red dots
+  List<Marker> _nearbyVehicleMarkers = [];
   // Turn debug markers
   List<Marker> _turnDetectionMarkers = [];
   final Set<String> _crossedTurnKeys = {};
@@ -1100,6 +1102,30 @@ class _HomePageState extends State<HomePage> {
             });
           }
         });
+      }
+
+      // Parse nearby vehicles from backend response (red dots on map)
+      if (payload['nearbyVehicles'] is List) {
+        final markers = (payload['nearbyVehicles'] as List).map((v) {
+          return Marker(
+            point: LatLng(
+              (v['lat'] as num).toDouble(),
+              (v['lng'] as num).toDouble(),
+            ),
+            child: Container(
+              width: 10,
+              height: 10,
+              decoration: const BoxDecoration(
+                color: Colors.red,
+                shape: BoxShape.circle,
+                boxShadow: [
+                  BoxShadow(color: Colors.black26, blurRadius: 2),
+                ],
+              ),
+            ),
+          );
+        }).toList();
+        if (mounted) setState(() => _nearbyVehicleMarkers = markers);
       }
 
       // Extract Redis connection status
@@ -2957,6 +2983,8 @@ class _HomePageState extends State<HomePage> {
                             ),
                           ],
                         ),
+                      if (_nearbyVehicleMarkers.isNotEmpty)
+                        MarkerLayer(markers: _nearbyVehicleMarkers),
                       MarkerLayer(
                         markers: [
                           Marker(
