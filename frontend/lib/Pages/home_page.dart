@@ -1148,9 +1148,17 @@ class _HomePageState extends State<HomePage> {
 
         // Part 3: Build map markers from backend pre-computed database turns
         final backendMarkers = _buildBackendTurnMarkers(turns);
-        if (mounted) {
+        if (mounted && _fusedPosition != null) {
+          final double currentRadius = _getScanRadius();
+          final filtered = backendMarkers.where((m) {
+            final dist = _distance(
+              _fusedPosition!.latitude, _fusedPosition!.longitude,
+              m.point.latitude, m.point.longitude,
+            );
+            return dist <= currentRadius;
+          }).toList();
           setState(() {
-            _backendTurnMarkers = backendMarkers;
+            _backendTurnMarkers = filtered;
           });
         }
 
@@ -1819,14 +1827,12 @@ class _HomePageState extends State<HomePage> {
   }
 
   double _getScanRadius() {
-    // FIX DRAWBACK 4: Speed-based scan radius with 200m cap
-    // REASON: 150m max was too short for 60km/h (16.7m/s * 10s = 167m)
-    // EXPECTED: At 60km/h → 200m radius detects junction 10s+ before arrival
+    // Speed-based scan radius with speed-based radius
     final speed = _lastSpeed ?? 0;
-    if (speed > 13.9) return 200;   // > 50 km/h → 200m
-    if (speed > 8.3)  return 150;   // > 30 km/h → 150m
-    if (speed > 4.2)  return 100;   // > 15 km/h → 100m
-    return 60;                      // slow speed
+    if (speed > 13.9) return 400;   // > 50 km/h → 400m
+    if (speed > 8.3)  return 300;   // > 30 km/h → 300m
+    if (speed > 4.2)  return 200;   // > 15 km/h → 200m
+    return 120;                     // slow speed
   }
 
   // Cache position for road data fetch-distance check
