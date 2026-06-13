@@ -2004,6 +2004,14 @@ class _HomePageState extends State<HomePage> {
 
     if (elements.isEmpty) return [];
 
+    // Use compass heading when stationary (GPS course is random at speed ~ 0)
+    final bool useCompassHeading = (_lastSpeed ?? 0) < 0.5 && _hasCompassHeading;
+    final double scanHeading = useCompassHeading
+        ? normalizeAngleDeg(_rotation)
+        : (_lastHeading != null && _lastHeading! >= 0
+            ? normalizeAngleDeg(_lastHeading!)
+            : double.nan);
+
     // ─── Build node-to-ways map from ALL elements ───
     final Map<int, List<int>> nodeToWays = {};
     final Map<int, List> otherGeoms = {};
@@ -2089,7 +2097,7 @@ class _HomePageState extends State<HomePage> {
       if (minSegDist > scanRadius) continue;
 
       final segBearing = _bearing(pts[segIdx], pts[segIdx + 1]);
-      double hdgDiff = (_lastHeading ?? segBearing) - segBearing;
+      double hdgDiff = (scanHeading.isNaN ? segBearing : scanHeading) - segBearing;
       if (hdgDiff > 180) hdgDiff -= 360;
       if (hdgDiff < -180) hdgDiff += 360;
       final goingForward = hdgDiff.abs() <= 90;
@@ -2252,7 +2260,7 @@ class _HomePageState extends State<HomePage> {
       ..sort((a, b) => (a['distance'] as double).compareTo(b['distance'] as double));
 
     // ─── Cone filter: keep only turns within 60° forward cone ───
-    final heading = _lastHeading ?? 0;
+    final heading = scanHeading.isNaN ? 0 : scanHeading;
     final coneFiltered = allTurns.where((t) => _isInCone(
       lat, lon, heading,
       t['intersectionLat'] as double,
