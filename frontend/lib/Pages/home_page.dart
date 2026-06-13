@@ -282,7 +282,6 @@ class _HomePageState extends State<HomePage> {
   // Road matching (map-matching) state
   bool _onRoad = false;
   LatLng? _snappedPosition;
-  double? _roadHeadingDeg;
   List<dynamic>? _cachedRoadData;
   DateTime? _cachedRoadDataTime;
 
@@ -810,7 +809,6 @@ class _HomePageState extends State<HomePage> {
         DateTime.now().difference(_cachedRoadDataTime!).inSeconds > 60) {
       _onRoad = false;
       _snappedPosition = null;
-      _roadHeadingDeg = null;
       return;
     }
 
@@ -840,7 +838,6 @@ class _HomePageState extends State<HomePage> {
     if (bestWay == null || bestSegmentDist > 10) {
       _onRoad = false;
       _snappedPosition = null;
-      _roadHeadingDeg = null;
       return;
     }
 
@@ -855,13 +852,6 @@ class _HomePageState extends State<HomePage> {
     );
 
     _snappedPosition = _projectOnSegment(LatLng(lat, lon), pt1, pt2);
-
-    final segBearing = _bearing(pt1, pt2);
-    double headingDiff = (_lastHeading ?? segBearing) - segBearing;
-    if (headingDiff > 180) headingDiff -= 360;
-    if (headingDiff < -180) headingDiff += 360;
-    final goingForward = headingDiff.abs() <= 90;
-    _roadHeadingDeg = goingForward ? segBearing : (segBearing + 180) % 360;
     _onRoad = true;
   }
 
@@ -886,20 +876,6 @@ class _HomePageState extends State<HomePage> {
     }
 
     final bool movingFast = (_lastSpeed ?? 0) > 2.5;
-
-    // 1) Road heading (from map matching) is most stable and correct
-    if (_onRoad && _roadHeadingDeg != null) {
-      _usingGpsCourse = false;
-      final double chosen = normalize(_roadHeadingDeg!);
-      const double alpha = 0.5;
-      double current = _displayHeadingDeg;
-      double delta = chosen - current;
-      if (delta > 180) delta -= 360;
-      if (delta < -180) delta += 360;
-      double next = current + alpha * delta;
-      _displayHeadingDeg = normalize(next);
-      return;
-    }
 
     double? gpsCourseDeg = (_lastHeading != null && _lastHeading! >= 0)
         ? normalize(_lastHeading!)
