@@ -2260,7 +2260,7 @@ class _HomePageState extends State<HomePage> {
       ..sort((a, b) => (a['distance'] as double).compareTo(b['distance'] as double));
 
     // ─── Cone filter: keep only turns within 60° forward cone ───
-    final heading = scanHeading.isNaN ? 0 : scanHeading;
+    final heading = scanHeading.isNaN ? 0.0 : scanHeading;
     final coneFiltered = allTurns.where((t) => _isInCone(
       lat, lon, heading,
       t['intersectionLat'] as double,
