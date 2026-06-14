@@ -1126,6 +1126,13 @@ class _HomePageState extends State<HomePage> {
         _updateTimeOffset(payload['serverTime'] as int);
       }
 
+      // Extract Redis connection status (before mapMatch to avoid crash blocking it)
+      if (payload['redisConnected'] is bool) {
+        if (mounted) {
+          setState(() => _redisConnected = payload['redisConnected'] as bool);
+        }
+      }
+
       // Sprint 1: Extract map matching info from response
       if (payload['mapMatch'] is Map) {
         final mm = payload['mapMatch'] as Map;
@@ -1133,7 +1140,7 @@ class _HomePageState extends State<HomePage> {
         debugPrint('🗺️ Server map match: road=${mm['roadId']} conf=${(mm['confidence'] * 100).toStringAsFixed(0)}%');
 
         // When road changes, cache all junctions from backend
-        final newRoadId = mm['roadId'] as String?;
+        final newRoadId = mm['roadId']?.toString();
         if (newRoadId != null && newRoadId != _currentRoadId) {
           _currentRoadId = newRoadId;
           _crossedTurnKeys.clear();
@@ -1221,13 +1228,6 @@ class _HomePageState extends State<HomePage> {
           );
         }).toList();
         if (mounted) setState(() => _nearbyVehicleMarkers = markers);
-      }
-
-      // Extract Redis connection status
-      if (payload['redisConnected'] is bool) {
-        if (mounted) {
-          setState(() => _redisConnected = payload['redisConnected'] as bool);
-        }
       }
 
       // Extract upcoming turns from backend response
@@ -1928,6 +1928,32 @@ class _HomePageState extends State<HomePage> {
     if (speed > 8.3)  return 300;   // > 30 km/h → 300m
     if (speed > 4.2)  return 200;   // > 15 km/h → 200m
     return 120;                     // slow speed
+  }
+
+  List<LatLng> _buildRadiusCircle(LatLng center, double radiusMeters, {int segments = 64}) {
+    final List<LatLng> points = [];
+    const double earthRadius = 6371000;
+
+    final double latRad = center.latitude * (pi / 180);
+    final double lonRad = center.longitude * (pi / 180);
+
+    for (int i = 0; i < segments; i++) {
+      final double angle = (2 * pi * i) / segments;
+      final double angDist = radiusMeters / earthRadius;
+
+      final double lat = asin(
+        sin(latRad) * cos(angDist) +
+        cos(latRad) * sin(angDist) * cos(angle),
+      );
+      final double lon = lonRad + atan2(
+        sin(angle) * sin(angDist) * cos(latRad),
+        cos(angDist) - sin(latRad) * sin(lat),
+      );
+
+      points.add(LatLng(lat * (180 / pi), lon * (180 / pi)));
+    }
+
+    return points;
   }
 
   // Cache position for road data fetch-distance check
@@ -3097,18 +3123,22 @@ class _HomePageState extends State<HomePage> {
                             ),
                           ],
                         ),
-                      // Scan radius circle (speed-adaptive 60-200m)
-                      CircleLayer(
-                        circles: [
-                          CircleMarker(
-                            point: _snappedPosition ?? _currentPosition!,
-                            radius: _getScanRadius().toDouble(),
-                            color: Colors.blue.withValues(alpha: 0.04),
-                            borderColor: Colors.blue.withValues(alpha: 0.2),
-                            borderStrokeWidth: 1.5,
-                          ),
-                        ],
-                      ),
+                      // Scan radius circle (speed-adaptive meter-accurate)
+                      if (_currentPosition != null)
+                        PolygonLayer(
+                          polygons: [
+                            Polygon(
+                              points: _buildRadiusCircle(
+                                _snappedPosition ?? _currentPosition!,
+                                _getScanRadius(),
+                              ),
+                              color: Colors.blue.withValues(alpha: 0.04),
+                              borderColor: Colors.blue.withValues(alpha: 0.2),
+                              borderStrokeWidth: 1.5,
+                              label: '${_getScanRadius().toInt()}m',
+                            ),
+                          ],
+                        ),
                       if (_nearbyVehicleMarkers.isNotEmpty)
                         MarkerLayer(markers: _nearbyVehicleMarkers),
                       MarkerLayer(
