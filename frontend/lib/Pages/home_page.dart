@@ -49,28 +49,27 @@ double getAlertDistanceFromRisk(int riskLevel) {
 
 /// FIX DRAWBACK 1: Classifies junction type from complete direction set
 /// Uses ALL roads at a node, not just one road's perspective
+/// FIX KNOWN #3: angle-based classification replaces direction-only approach
 String classifyJunctionType(Set<String> dirs, int totalRoadsAtNode, bool hasStraight, double? maxAngleDiff) {
   if (dirs.contains("straight") && dirs.length >= 3) {
     return "cross";
   }
-  if (!dirs.contains("straight") && dirs.length >= 2) {
-    if (dirs.contains("left") && dirs.contains("right") && totalRoadsAtNode <= 4) {
-      return "y_junction";
-    }
+  if (dirs.contains("left") && dirs.contains("right") && dirs.length >= 2) {
+    if (hasStraight) return "cross";
+    return "y_junction";
+  }
+  if (dirs.length >= 2 && !dirs.contains("straight")) {
     return "t_junction";
   }
-  if (dirs.length == 1 && dirs.contains("straight")) {
-    return "straight";
-  }
-  if (dirs.length == 1 && maxAngleDiff != null) {
-    final absAngle = maxAngleDiff.abs();
-    final dir = maxAngleDiff > 0 ? "right" : "left";
-    if (absAngle > 150) return "hairpin_$dir";
-    if (absAngle > 90) return "sharp_$dir";
-    if (absAngle > 30) return "${dir}_turn";
-    return "slight_$dir";
-  }
-  return "complex";
+  if (maxAngleDiff == null) return "complex";
+  final absAngle = maxAngleDiff.abs();
+  final dir = maxAngleDiff > 0 ? "right" : "left";
+  if (absAngle < 15) return "straight";
+  if (absAngle < 30) return "slight_$dir";
+  if (absAngle < 60) return "${dir}_turn";
+  if (absAngle < 90) return "sharp_$dir";
+  if (absAngle < 150) return "very_sharp_$dir";
+  return "hairpin_$dir";
 }
 
 /// Normalize angle to 0-360 range
@@ -281,6 +280,7 @@ class _HomePageState extends State<HomePage> {
 
   // Road matching (map-matching) state
   bool _onRoad = false;
+  double? _roadHeadingDeg; // FIX ISSUE #17: backend roadHeading for arrow
   LatLng? _snappedPosition;
   List<dynamic>? _cachedRoadData;
   DateTime? _cachedRoadDataTime;
@@ -309,6 +309,11 @@ class _HomePageState extends State<HomePage> {
   DateTime? _lastTimestamp;
   double? _lastSpeed;
   double? _lastHeading;
+  // FIX ISSUE #15: gyro grace period after 90°+ heading jump without GPS change
+  double? _lastGpsHeading;
+  bool _gyroStill = false;
+  bool _headingJumpDetected = false;
+  int _gyroGraceUntil = 0;
 
   AccelerometerEvent? _lastAccel;
   GyroscopeEvent? _lastGyro;
@@ -522,8 +527,9 @@ class _HomePageState extends State<HomePage> {
       _currentPosition = LatLng(pos.latitude, pos.longitude);
     } else {
       // Predict step (run every time, even without gyro updates)
+      // FIX ISSUE #15: zero gyro during grace period to suppress spurious turns
       _kalman.predict(nowMs,
-        gyroZ: _lastGyro?.z ?? 0,
+        gyroZ: _gyroStill ? 0 : (_lastGyro?.z ?? 0),
         accelMagnitude: _lastAccel != null
             ? (_lastAccel!.x.abs() + _lastAccel!.y.abs() + _lastAccel!.z.abs()) / 3
             : 0,
@@ -575,7 +581,15 @@ class _HomePageState extends State<HomePage> {
 
     _lastTimestamp = now;
     _lastSpeed = pos.speed;
+    _lastGpsHeading = pos.heading;
     _lastHeading = pos.heading;
+    // FIX ISSUE #15: start 3s gyro grace period if heading jump was previously detected
+    if (_headingJumpDetected) {
+      _gyroStill = true;
+      _gyroGraceUntil = DateTime.now().millisecondsSinceEpoch + 3000;
+      _headingJumpDetected = false;
+      debugPrint('🔄 Gyro grace period started (3s)');
+    }
     _matchToRoad(pos.latitude, pos.longitude);
     _updateHeadingFromSources();
 
@@ -611,11 +625,17 @@ class _HomePageState extends State<HomePage> {
   }
 
   // Sprint 1: Sensor quality score (0.0–1.0)
+  // FIX ISSUE #9: else-if prevents cascading multiplication of GPS penalties
   double _computeSensorQuality() {
     double score = 1.0;
-    if (_lastGpsAccuracy > 10) score *= 0.8;
-    if (_lastGpsAccuracy > 25) score *= 0.5;
-    if (_lastGpsAccuracy > 50) score *= 0.3;
+    // GPS accuracy: use only the highest applicable penalty tier
+    if (_lastGpsAccuracy > 50) {
+      score *= 0.3;
+    } else if (_lastGpsAccuracy > 25) {
+      score *= 0.5;
+    } else if (_lastGpsAccuracy > 10) {
+      score *= 0.8;
+    }
     if (_lastGyro == null) score *= 0.7;
     if (!_hasCompassHeading) score *= 0.9;
     if (_lastSpeed != null && _lastSpeed! < 0.5) score *= 0.95;
@@ -968,9 +988,13 @@ class _HomePageState extends State<HomePage> {
 
     double? compassDeg = _hasCompassHeading ? normalize(_rotation) : null;
 
-    // If moving > ~2.5 m/s (~9 km/h), prefer GPS course as it's usually more stable while driving
+    // FIX ISSUE #17: backend road heading is most reliable (road-constrained)
+    // Precedes GPS and compass to prevent junction snap artifact
     double? chosen;
-    if (movingFast && gpsCourseDeg != null) {
+    if (_roadHeadingDeg != null) {
+      _usingGpsCourse = true;
+      chosen = normalize(_roadHeadingDeg!);
+    } else if (movingFast && gpsCourseDeg != null) {
       _usingGpsCourse = true;
       chosen = gpsCourseDeg;
     } else if (compassDeg != null) {
@@ -982,6 +1006,30 @@ class _HomePageState extends State<HomePage> {
     }
 
     if (chosen == null) return;
+
+    // FIX ISSUE #15: expiry check for gyro grace period
+    if (_gyroStill && DateTime.now().millisecondsSinceEpoch >= _gyroGraceUntil) {
+      _gyroStill = false;
+      debugPrint('🔄 Gyro grace period expired');
+    }
+
+    // FIX ISSUE #15: during grace period, keep display heading at GPS heading
+    if (_gyroStill && _lastGpsHeading != null) {
+      _displayHeadingDeg = normalize(_lastGpsHeading!);
+      _usingGpsCourse = true;
+      return;
+    }
+
+    // FIX ISSUE #15: detect gyro-only heading jump without GPS change
+    if (_lastGpsHeading != null && _lastHeading != null && !_gyroStill) {
+      // If chosen heading (from compass/gyro) differs from last GPS heading by 90°+
+      final double headingDiff = (chosen - _lastGpsHeading!).abs() % 360;
+      final double gpsDiff = (_lastHeading! - _lastGpsHeading!).abs() % 360;
+      if (headingDiff > 90 && headingDiff < 270 && gpsDiff < 30) {
+        _headingJumpDetected = true;
+        debugPrint('🔄 Heading jump ${headingDiff.toStringAsFixed(0)}° detected without GPS change');
+      }
+    }
 
     // Apply user calibration offset before smoothing
     chosen = normalize(chosen + _calibrationOffsetDeg);
@@ -1022,6 +1070,9 @@ class _HomePageState extends State<HomePage> {
   // FIX BUG #28: Buffer unsent messages during disconnect, flush on reconnect
   final List<Map<String, dynamic>> _pendingMessages = [];
   static const int _maxPendingMessages = 30;
+  // FIX ISSUE #16: replay cache of last N successfully sent messages
+  final List<Map<String, dynamic>> _sentCache = [];
+  static const int _maxSentCache = 5;
 
   // ======================
   // WebSocket + Data Sender
@@ -1063,6 +1114,17 @@ class _HomePageState extends State<HomePage> {
             }
           }
           _pendingMessages.clear();
+        }
+        // FIX ISSUE #16: replay recent sent messages to fill gap on server
+        if (_sentCache.isNotEmpty) {
+          debugPrint('📤 Replaying ${_sentCache.length} recent messages');
+          for (final cachedMsg in _sentCache) {
+            try {
+              _ws!.sink.add(jsonEncode(cachedMsg));
+            } catch (e) {
+              debugPrint('❌ Failed to replay cached message: $e');
+            }
+          }
         }
         // Start sending data every second
         _sendTimer = Timer.periodic(const Duration(seconds: 1), (_) async {
@@ -1121,9 +1183,18 @@ class _HomePageState extends State<HomePage> {
       final dynamic payload = jsonDecode(text);
       if (payload is! Map) return;
 
-      // Sprint 1: Time sync from server response
-      if (payload['serverTime'] is int) {
-        _updateTimeOffset(payload['serverTime'] as int);
+      // FIX ISSUE #2: one-directional time sync — store offset from server
+      if (payload['timeSyncOffset'] is num) {
+        final offset = (payload['timeSyncOffset'] as num).toDouble();
+        _timeOffsets.add(offset);
+        if (_timeOffsets.length > 20) _timeOffsets.removeAt(0);
+        if (_timeOffsets.length >= 3) {
+          final mean = _timeOffsets.reduce((a, b) => a + b) / _timeOffsets.length;
+          final variance = _timeOffsets.fold(0.0, (sum, v) => sum + (v - mean) * (v - mean)) / _timeOffsets.length;
+          final stdDev = sqrt(variance.abs());
+          _timeOffset = mean;
+          _timeSyncConfidence = (1.0 - (stdDev / 500).clamp(0.0, 0.9)).clamp(0.1, 1.0);
+        }
       }
 
       // Extract Redis connection status (before mapMatch to avoid crash blocking it)
@@ -1138,6 +1209,18 @@ class _HomePageState extends State<HomePage> {
         final mm = payload['mapMatch'] as Map;
         // Server-snapped position is authoritative
         debugPrint('🗺️ Server map match: road=${mm['roadId']} conf=${(mm['confidence'] * 100).toStringAsFixed(0)}%');
+
+        // FIX ISSUE #17: backend roadHeading used for map arrow direction
+        // Prevents junction snap artifact by using road-constrained heading
+        if (mm['matched'] == true && (mm['confidence'] ?? 0.0) > 0.5) {
+          final rh = mm['roadHeading'];
+          if (rh != null) {
+            setState(() {
+              _roadHeadingDeg = (rh as num).toDouble();
+              _onRoad = true;
+            });
+          }
+        }
 
         // When road changes, cache all junctions from backend
         final newRoadId = mm['roadId']?.toString();
@@ -1484,7 +1567,7 @@ class _HomePageState extends State<HomePage> {
       "positionUncertainty": _kalman.initialized ? _kalman.getUncertainty() : 10.0,
       "sensorQuality": _computeSensorQuality(),
       "clientTime": nowMs,
-      "serverTime": nowMs + _timeOffset.round(),
+      // FIX ISSUE #2: removed serverTime from payload — one-directional sync
       "timeSyncConfidence": _timeSyncConfidence,
       "gpsAccuracy": _lastGpsAccuracy,
     };
@@ -1515,6 +1598,11 @@ class _HomePageState extends State<HomePage> {
       _ws!.sink.add(jsonEncode(payload));
       _lastDataSent = DateTime.now();
       _lastSentData = payload;
+      // FIX ISSUE #16: cache last N sent messages for replay on reconnect
+      _sentCache.add(payload as Map<String, dynamic>);
+      if (_sentCache.length > _maxSentCache) {
+        _sentCache.removeAt(0);
+      }
 
       setState(() {
         _isSendingData = false;
@@ -1907,15 +1995,37 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  // FIX ISSUE #25: cache size limited to 500KB, slim fields only
   Future<void> _saveRoadCache() async {
     if (_cachedRoadData == null || _lastRoadFetchPosition == null) return;
     try {
       final box = Hive.box('roadCache');
-      await box.put('roadElements', _cachedRoadData);
+
+      // Keep only essential fields for each element
+      final slimData = _cachedRoadData!.map((el) {
+        final m = el as Map<dynamic, dynamic>;
+        return {
+          'id': m['id'],
+          'nodes': m['nodes'],
+          'geometry': m['geometry'],
+          'type': m['type'],
+        };
+      }).toList();
+
+      // Enforce 500KB size cap
+      final jsonStr = jsonEncode(slimData);
+      if (jsonStr.length > 512000) {
+        debugPrint('🗺️ Cache too large (${jsonStr.length} bytes), keeping most recent entries');
+        while (jsonEncode(slimData).length > 512000 && slimData.length > 50) {
+          slimData.removeAt(0);
+        }
+      }
+
+      await box.put('roadElements', slimData);
       await box.put('roadCacheTime', DateTime.now().millisecondsSinceEpoch);
       await box.put('roadCacheLat', _lastRoadFetchPosition!.latitude);
       await box.put('roadCacheLon', _lastRoadFetchPosition!.longitude);
-      debugPrint('🗺️ Saved ${_cachedRoadData!.length} roads to persistent cache');
+      debugPrint('🗺️ Saved ${slimData.length} roads to persistent cache (${jsonEncode(slimData).length} bytes)');
     } catch (e) {
       debugPrint('⚠️ Failed to save road cache: $e');
     }
@@ -2116,7 +2226,8 @@ class _HomePageState extends State<HomePage> {
   bool _isInCone(double originLat, double originLng, double headingDeg,
       double targetLat, double targetLng, double coneAngleDeg, double maxRangeM) {
     final dist = _distance(originLat, originLng, targetLat, targetLng);
-    if (dist > maxRangeM || dist < 1) return false;
+    // FIX ISSUE #23: junction visible until 0.1m not 1m (was hiding junctions at close range)
+    if (dist > maxRangeM || dist < 0.1) return false;
     final bearing = _bearing(LatLng(originLat, originLng), LatLng(targetLat, targetLng));
     double diff = (bearing - headingDeg) % 360;
     if (diff > 180) diff -= 360;
@@ -2191,6 +2302,9 @@ class _HomePageState extends State<HomePage> {
     }
 
     // ─── Scan ALL roads for junctions ───
+    // FIX ISSUE #5/#19: hoisted before the loop so _processBendsFromGeometryOnly can access them
+    final heading = scanHeading.isNaN ? 0.0 : scanHeading;
+    final List<Map<String, dynamic>> bendResults = [];
     final List<Map<String, dynamic>> allJunctions = [];
     bool? bestGoingForward;
 
@@ -2206,9 +2320,12 @@ class _HomePageState extends State<HomePage> {
           .map((p) => LatLng(p['lat'] as double, p['lon'] as double))
           .toList();
 
-      // Defensive: skip roads where nodes/geometry length mismatch
+      // FIX ISSUE #19: geometry-only fallback when nodes mismatched
+      // Process bends from geometry even when node data is unavailable
       if (nodes.length != pts.length) {
-        debugPrint('⚠️ Road $roadId: nodes(${nodes.length}) != geometry(${pts.length}) — skipping');
+        _turnDebug.phase2Executed = true;
+        _turnDebug.bendThreshold = 30.0;
+        _processBendsFromGeometryOnly(el, pts, lat, lon, scanHeading, scanRadius, heading, bendResults, bestWay);
         continue;
       }
 
@@ -2358,22 +2475,24 @@ class _HomePageState extends State<HomePage> {
         debugPrint('🚧 Junction found: $type (risk=$riskLevel) at ${dist.toStringAsFixed(1)}m on road $roadId');
       }
 
+      // FIX ISSUE #4: explicit forward/backward with segIdx=0 edge case handled
       if (goingForward) {
+        // Forward scan: always includes node 0 when vehicle near start of road
         for (int j = segIdx; j < pts.length; j++) {
           scanNode(j);
         }
-        // FIX DRAWBACK 2: Also scan behind segIdx on the best road for short roads
+        // Backward scan only if segIdx > 0 (segIdx=0 → backward loop never runs)
         if (roadId == bestWay?['id']) {
           for (int j = segIdx - 1; j >= 0; j--) {
             scanNode(j);
           }
         }
       } else {
-        // FIX DRAWBACK 2: Backward scan covers all indices including 0
+        // Backward scan: covers all indices including 0
         for (int j = segIdx; j >= 0; j--) {
           scanNode(j);
         }
-        // FIX DRAWBACK 2: Also scan the other endpoint of closest segment for short roads
+        // Forward scan for the other endpoint of closest segment
         if (segIdx + 1 < pts.length) {
           scanNode(segIdx + 1);
         }
@@ -2387,7 +2506,6 @@ class _HomePageState extends State<HomePage> {
       ..sort((a, b) => (a['distance'] as double).compareTo(b['distance'] as double));
 
     // ─── Cone filter: keep only turns within 60° forward cone ───
-    final heading = scanHeading.isNaN ? 0.0 : scanHeading;
     final coneFiltered = allTurns.where((t) => _isInCone(
       lat, lon, heading,
       t['intersectionLat'] as double,
@@ -2396,50 +2514,60 @@ class _HomePageState extends State<HomePage> {
       scanRadius,
     )).toList();
 
-    // ─── Phase 2: Bend detection on the best way ───
+    // ─── Phase 2: Bend detection on ALL roads (not just bestWay) ───
+    // FIX ISSUE #5: Phase 2 now scans ALL roads not just closest one
     _turnDebug.phase2Executed = true;
     _turnDebug.bendThreshold = 30.0;
     _turnDebug.phase2Entries.clear();
-    final List<Map<String, dynamic>> bendResults = [];
 
-    if (bestWay != null && bestWay['geometry'] != null) {
-      final bestGeom = bestWay['geometry'] as List<dynamic>;
-      if (bestGeom.length >= 3) {
-        final bestPts = bestGeom
-            .map((p) => LatLng(p['lat'] as double, p['lon'] as double))
-            .toList();
+    for (final el in elements) {
+      if (el['geometry'] == null) continue;
+      final geom = el['geometry'] as List<dynamic>;
+      if (geom.length < 3) continue;
 
-        int segCount = 0;
-        double maxAngle = 0;
+      final pts = geom
+          .map((p) => LatLng(p['lat'] as double, p['lon'] as double))
+          .toList();
 
-        // Scan in the direction of travel from current position
-        final forward = bestGoingForward ?? true;
-        final int iStart, iEnd, iStep;
-        if (forward) {
-          iStart = bestSegmentIndex;
-          iEnd = bestPts.length - 2;
-          iStep = 1;
-        } else {
-          iStart = bestSegmentIndex > 0 ? bestSegmentIndex - 1 : 0;
-          iEnd = 1;
-          iStep = -1;
-          // FIX DRAWBACK 2: Also scan forward end for short roads in backward mode
-        }
+      final elSegIdx = _findClosestSegmentIdx(pts, lat, lon);
+      if (elSegIdx < 0) continue;
 
-        for (int i = iStart; forward ? i < iEnd : i > iEnd; i += iStep) {
-          final d = _distance(lat, lon, bestPts[i + 1].latitude, bestPts[i + 1].longitude);
-          if (d > scanRadius) break;
+      final elSegBearing = _bearing(pts[elSegIdx], pts[elSegIdx + 1]);
+      double hdg = scanHeading.isNaN ? elSegBearing : scanHeading;
+      double diff = hdg - elSegBearing;
+      if (diff > 180) diff -= 360;
+      if (diff < -180) diff += 360;
+      final elGoingForward = diff.abs() <= 90;
 
-          final b1 = _bearing(bestPts[i], bestPts[i + 1]);
-          final b2 = _bearing(bestPts[i + 1], bestPts[i + 2]);
-          double angleChange = (b2 - b1) % 360;
-          if (angleChange > 180) angleChange -= 360;
-          final absAngle = angleChange.abs();
-          segCount++;
+      int segCount = 0;
+      double maxAngle = 0;
 
-          if (absAngle > maxAngle) maxAngle = absAngle;
+      final int iStart, iEnd, iStep;
+      if (elGoingForward) {
+        iStart = elSegIdx;
+        iEnd = pts.length - 2;
+        iStep = 1;
+      } else {
+        iStart = elSegIdx > 0 ? elSegIdx - 1 : 0;
+        iEnd = 1;
+        iStep = -1;
+      }
 
-          final aboveThreshold = absAngle > (_turnDebug.bendThreshold ?? 30.0);
+      for (int i = iStart; elGoingForward ? i < iEnd : i > iEnd; i += iStep) {
+        final d = _distance(lat, lon, pts[i + 1].latitude, pts[i + 1].longitude);
+        if (d > scanRadius) break;
+
+        final b1 = _bearing(pts[i], pts[i + 1]);
+        final b2 = _bearing(pts[i + 1], pts[i + 2]);
+        double angleChange = (b2 - b1) % 360;
+        if (angleChange > 180) angleChange -= 360;
+        final absAngle = angleChange.abs();
+        segCount++;
+
+        if (absAngle > maxAngle) maxAngle = absAngle;
+
+        final aboveThreshold = absAngle > (_turnDebug.bendThreshold ?? 30.0);
+        if (el['id'] == bestWay?['id']) {
           _turnDebug.phase2Entries.add(Phase2Entry(
             segmentIndex: i,
             distance: d,
@@ -2448,113 +2576,57 @@ class _HomePageState extends State<HomePage> {
             angleChange: absAngle,
             aboveThreshold: aboveThreshold,
           ));
-
-          if (aboveThreshold) {
-            final bendLat = bestPts[i + 1].latitude;
-            final bendLng = bestPts[i + 1].longitude;
-
-            // FIX DRAWBACK 5: 60° cone filter for bends
-            // REASON: Bends behind vehicle were reported as upcoming
-            // EXPECTED: Only bends ahead in travel direction are reported
-            if (!_isInCone(lat, lon, heading, bendLat, bendLng, 60.0, scanRadius)) {
-              debugPrint('🗺️ Bend behind vehicle skipped: ${absAngle.toStringAsFixed(0)}° at ${d.toStringAsFixed(0)}m');
-              continue;
-            }
-
-            final bendDir = angleChange > 0 ? "right" : "left";
-            String bendType;
-            if (absAngle > 90) {
-              bendType = "sharp_${bendDir}_bend";
-            } else if (absAngle > 60) {
-              bendType = "moderate_${bendDir}_bend";
-            } else {
-              bendType = "gentle_${bendDir}_bend";
-            }
-
-            // FIX DRAWBACK 3: Add riskLevel for bends too
-            final bendRisk = getRiskLevelFromAngle(absAngle);
-            final bendAlertDist = getAlertDistanceFromRisk(bendRisk);
-
-            bendResults.add({
-              "exists": true,
-              "type": bendType,
-              "distance": d,
-              "angle": absAngle,
-              "intersectionLat": bendLat,
-              "intersectionLng": bendLng,
-              "directions": [bendDir],
-              "approachBearing": b1,
-              "roads": [bestWay['id']],
-              "roadId": bestWay['id'],
-              "isBend": true,
-              "riskLevel": bendRisk,
-              "alertDistanceM": bendAlertDist,
-            });
-          }
         }
 
-        // FIX DRAWBACK 2: For short roads in backward mode, scan forward too
-        if (!forward && bestSegmentIndex + 2 < bestPts.length) {
-          final i = bestSegmentIndex;
-          final d = _distance(lat, lon, bestPts[i + 1].latitude, bestPts[i + 1].longitude);
-          if (d <= scanRadius) {
-            final b1 = _bearing(bestPts[i], bestPts[i + 1]);
-            final b2 = _bearing(bestPts[i + 1], bestPts[i + 2]);
-            double angleChange = (b2 - b1) % 360;
-            if (angleChange > 180) angleChange -= 360;
-            final absAngle = angleChange.abs();
-            if (absAngle > (_turnDebug.bendThreshold ?? 30.0)) {
-              final bendLat = bestPts[i + 1].latitude;
-              final bendLng = bestPts[i + 1].longitude;
-              if (_isInCone(lat, lon, heading, bendLat, bendLng, 60.0, scanRadius)) {
-                final bendDir = angleChange > 0 ? "right" : "left";
-                String bendType;
-                if (absAngle > 90) {
-                  bendType = "sharp_${bendDir}_bend";
-                } else if (absAngle > 60) {
-                  bendType = "moderate_${bendDir}_bend";
-                } else {
-                  bendType = "gentle_${bendDir}_bend";
-                }
-                final bendRisk = getRiskLevelFromAngle(absAngle);
-                bendResults.add({
-                  "exists": true,
-                  "type": bendType,
-                  "distance": d,
-                  "angle": absAngle,
-                  "intersectionLat": bendLat,
-                  "intersectionLng": bendLng,
-                  "directions": [bendDir],
-                  "approachBearing": b1,
-                  "roads": [bestWay['id']],
-                  "roadId": bestWay['id'],
-                  "isBend": true,
-                  "riskLevel": bendRisk,
-                  "alertDistanceM": getAlertDistanceFromRisk(bendRisk),
-                });
-              }
-            }
-          }
-        }
+        if (aboveThreshold) {
+          final bendLat = pts[i + 1].latitude;
+          final bendLng = pts[i + 1].longitude;
 
+          if (!_isInCone(lat, lon, heading, bendLat, bendLng, 60.0, scanRadius)) {
+            continue;
+          }
+
+          final bendDir = angleChange > 0 ? "right" : "left";
+          String bendType;
+          if (absAngle > 90) {
+            bendType = "sharp_${bendDir}_bend";
+          } else if (absAngle > 60) {
+            bendType = "moderate_${bendDir}_bend";
+          } else {
+            bendType = "gentle_${bendDir}_bend";
+          }
+
+          final bendRisk = getRiskLevelFromAngle(absAngle);
+          final bendAlertDist = getAlertDistanceFromRisk(bendRisk);
+
+          bendResults.add({
+            "exists": true,
+            "type": bendType,
+            "distance": d,
+            "angle": absAngle,
+            "intersectionLat": bendLat,
+            "intersectionLng": bendLng,
+            "directions": [bendDir],
+            "approachBearing": b1,
+            "roads": [el['id']],
+            "roadId": el['id'],
+            "isBend": true,
+            "riskLevel": bendRisk,
+            "alertDistanceM": bendAlertDist,
+          });
+        }
+      }
+
+      if (el['id'] == bestWay?['id']) {
         _turnDebug.segmentsWithinRadius = segCount;
         _turnDebug.maxAngleChange = maxAngle;
-        _turnDebug.bendDetected = bendResults.isNotEmpty;
-        _turnDebug.phase2Result = bendResults.isNotEmpty
-            ? '${bendResults.length} bend(s) found'
-            : 'no bends';
-      } else {
-        _turnDebug.segmentsWithinRadius = 0;
-        _turnDebug.maxAngleChange = 0;
-        _turnDebug.bendDetected = false;
-        _turnDebug.phase2Result = 'insufficient points (< 3)';
       }
-    } else {
-      _turnDebug.segmentsWithinRadius = 0;
-      _turnDebug.maxAngleChange = 0;
-      _turnDebug.bendDetected = false;
-      _turnDebug.phase2Result = 'no best way';
     }
+
+    _turnDebug.bendDetected = bendResults.isNotEmpty;
+    _turnDebug.phase2Result = bendResults.isNotEmpty
+        ? '${bendResults.length} bend(s) found'
+        : 'no bends';
 
     // Merge Phase 1 (cone-filtered) and Phase 2 (bend) results, deduplicate, sort
     final mergedTurns = [...coneFiltered, ...bendResults];
@@ -2637,6 +2709,86 @@ class _HomePageState extends State<HomePage> {
 
     return maxRisk;
   }
+  // FIX ISSUE #19: geometry-only bend detection when node data unavailable
+  // Scans geometry segments for bends only (no junction detection — needs node IDs)
+  void _processBendsFromGeometryOnly(
+    Map<dynamic, dynamic> el,
+    List<LatLng> pts,
+    double lat,
+    double lon,
+    double scanHeading,
+    double scanRadius,
+    double heading,
+    List<Map<String, dynamic>> bendResults,
+    dynamic bestWay,
+  ) {
+    if (pts.length < 3) return;
+    final elSegIdx = _findClosestSegmentIdx(pts, lat, lon);
+    if (elSegIdx < 0) return;
+    final elSegBearing = _bearing(pts[elSegIdx], pts[elSegIdx + 1]);
+    double hdg = scanHeading.isNaN ? elSegBearing : scanHeading;
+    double diff = hdg - elSegBearing;
+    if (diff > 180) diff -= 360;
+    if (diff < -180) diff += 360;
+    final elGoingForward = diff.abs() <= 90;
+    final int iStart, iEnd, iStep;
+    if (elGoingForward) {
+      iStart = elSegIdx;
+      iEnd = pts.length - 2;
+      iStep = 1;
+    } else {
+      iStart = elSegIdx > 0 ? elSegIdx - 1 : 0;
+      iEnd = 1;
+      iStep = -1;
+    }
+    for (int i = iStart; elGoingForward ? i < iEnd : i > iEnd; i += iStep) {
+      final d = _distance(lat, lon, pts[i + 1].latitude, pts[i + 1].longitude);
+      if (d > scanRadius) break;
+      final b1 = _bearing(pts[i], pts[i + 1]);
+      final b2 = _bearing(pts[i + 1], pts[i + 2]);
+      double angleChange = (b2 - b1) % 360;
+      if (angleChange > 180) angleChange -= 360;
+      final absAngle = angleChange.abs();
+      if (absAngle > (_turnDebug.bendThreshold ?? 30.0)) {
+        final bendLat = pts[i + 1].latitude;
+        final bendLng = pts[i + 1].longitude;
+        if (!_isInCone(lat, lon, heading, bendLat, bendLng, 60.0, scanRadius)) continue;
+        final bendDir = angleChange > 0 ? "right" : "left";
+        final bendType = absAngle > 90 ? "sharp_${bendDir}_bend" : absAngle > 60 ? "moderate_${bendDir}_bend" : "gentle_${bendDir}_bend";
+        final bendRisk = getRiskLevelFromAngle(absAngle);
+        bendResults.add({
+          "exists": true,
+          "type": bendType,
+          "distance": d,
+          "angle": absAngle,
+          "intersectionLat": bendLat,
+          "intersectionLng": bendLng,
+          "directions": [bendDir],
+          "approachBearing": b1,
+          "roads": [el['id']],
+          "roadId": el['id'],
+          "isBend": true,
+          "riskLevel": bendRisk,
+          "alertDistanceM": getAlertDistanceFromRisk(bendRisk),
+        });
+      }
+    }
+  }
+
+  // FIX ISSUE #5: helper for finding closest segment index on any road
+  int _findClosestSegmentIdx(List<LatLng> pts, double lat, double lon) {
+    double minDist = double.infinity;
+    int bestIdx = 0;
+    for (int i = 0; i < pts.length - 1; i++) {
+      final d = _distanceToSegment(lat, lon, pts[i], pts[i + 1]);
+      if (d < minDist) {
+        minDist = d;
+        bestIdx = i;
+      }
+    }
+    return minDist < double.infinity ? bestIdx : 0;
+  }
+
   double _distanceToSegment(
     double lat,
     double lon,
@@ -2697,6 +2849,20 @@ class _HomePageState extends State<HomePage> {
 
       _detectedTurns = turns;
       _primaryTurn = turns.isNotEmpty ? turns.first : null;
+
+      // FIX ISSUE #20: show banner when road data is stale or limited
+      if (mounted && _turnDetectionStatus != 'fresh') {
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(
+            _turnDetectionStatus == 'limited'
+                ? '⚠️ Turn detection limited — weak signal'
+                : '📡 Using cached road data',
+          ),
+          backgroundColor: Colors.orange.withOpacity(0.9),
+          duration: const Duration(seconds: 4),
+          behavior: SnackBarBehavior.floating,
+        ));
+      }
 
       _turnDebug.detectResult = turns.isNotEmpty ? turns.first : null;
       _turnDebug.turnInfoApplied = _primaryTurn ?? {"exists": false, "distance": null};
