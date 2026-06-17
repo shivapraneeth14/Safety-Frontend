@@ -16,6 +16,7 @@ import '../Config/app_config.dart';
 import '../Services/session_recorder.dart';
 import 'debug_overlay.dart';
 import 'turn_debug.dart';
+import '../road_utils.dart';
 import 'dart:io';
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
@@ -284,6 +285,7 @@ class _HomePageState extends State<HomePage> {
   LatLng? _snappedPosition;
   List<dynamic>? _cachedRoadData;
   DateTime? _cachedRoadDataTime;
+  List<Polyline> _roadPolylines = [];
 
   // Threat markers rendered as red dots
   List<Marker> _threatMarkers = [];
@@ -778,6 +780,28 @@ class _HomePageState extends State<HomePage> {
       ));
     }
     return markers;
+  }
+
+  List<Polyline> _buildRoadPolylines() {
+    if (_cachedRoadData == null) return [];
+    final polylines = <Polyline>[];
+    for (final el in _cachedRoadData!) {
+      if (el['geometry'] == null) continue;
+      final geom = el['geometry'] as List<dynamic>;
+      if (geom.length < 2) continue;
+      final pts = geom
+          .map((p) => LatLng(p['lat'] as double, p['lon'] as double))
+          .toList();
+      final tags = el['tags'];
+      final highway = (tags is Map) ? tags['highway']?.toString() : null;
+      final supported = isSupportedRoad(highway);
+      polylines.add(Polyline(
+        points: pts,
+        strokeWidth: 4.0,
+        color: supported ? const Color(0xFF6EC1FF) : const Color(0xFFBDBDBD),
+      ));
+    }
+    return polylines;
   }
 
   List<Marker> _buildRoadJunctionMarkers() {
@@ -1985,6 +2009,7 @@ class _HomePageState extends State<HomePage> {
           _cachedRoadData = (cached as List).cast<dynamic>();
           _cachedRoadDataTime = DateTime.fromMillisecondsSinceEpoch(cachedTime);
           _lastRoadFetchPosition = LatLng(cachedLat as double, cachedLon as double);
+          _roadPolylines = _buildRoadPolylines();
           debugPrint('🗺️ Loaded ${_cachedRoadData!.length} roads from persistent cache');
         } else {
           debugPrint('🗺️ Persistent cache expired (age=${age ~/ 1000}s)');
@@ -2009,6 +2034,7 @@ class _HomePageState extends State<HomePage> {
           'nodes': m['nodes'],
           'geometry': m['geometry'],
           'type': m['type'],
+          'tags': m['tags'],
         };
       }).toList();
 
@@ -2169,6 +2195,7 @@ class _HomePageState extends State<HomePage> {
       _turnDetectionStatus = 'fresh';
 
       _cachedRoadData = List.from(data['elements']);
+      _roadPolylines = _buildRoadPolylines();
       _cachedRoadDataTime = DateTime.now();
       _lastRoadFetchPosition = _fusedPosition;
       _saveRoadCache();
@@ -2407,28 +2434,41 @@ class _HomePageState extends State<HomePage> {
           }
           if (otherIdx < 0) continue;
 
-          final dirIdx = otherIdx + 1 < otherGeom.length ? otherIdx + 1 : otherIdx - 1;
-          if (dirIdx < 0 || dirIdx >= otherGeom.length) continue;
+          final List<double> otherBearings = [];
 
-          final ogDir = otherGeom[dirIdx] as Map<String, dynamic>;
-          final brg = _bearing(
-            pts[j],
-            LatLng(ogDir['lat'] as double, ogDir['lon'] as double),
-          );
-
-          double diff = (brg - approach) % 360;
-          if (diff > 180) diff -= 360;
-
-          if (maxAngleDiff == null || diff.abs() > maxAngleDiff.abs()) {
-            maxAngleDiff = diff;
+          // Forward direction (next node along the other road)
+          if (otherIdx + 1 < otherGeom.length) {
+            final ogDir = otherGeom[otherIdx + 1] as Map<String, dynamic>;
+            otherBearings.add(_bearing(
+              pts[j],
+              LatLng(ogDir['lat'] as double, ogDir['lon'] as double),
+            ));
           }
 
-          if (diff.abs() <= 30) {
-            sideRoads.add("straight");
-          } else if (diff > 30 && diff <= 150) {
-            sideRoads.add("right");
-          } else if (diff < -30 && diff >= -150) {
-            sideRoads.add("left");
+          // Backward direction (previous node — when this road passes through the junction)
+          if (otherIdx - 1 >= 0) {
+            final ogDir = otherGeom[otherIdx - 1] as Map<String, dynamic>;
+            otherBearings.add(_bearing(
+              pts[j],
+              LatLng(ogDir['lat'] as double, ogDir['lon'] as double),
+            ));
+          }
+
+          for (final brg in otherBearings) {
+            double diff = (brg - approach) % 360;
+            if (diff > 180) diff -= 360;
+
+            if (maxAngleDiff == null || diff.abs() > maxAngleDiff.abs()) {
+              maxAngleDiff = diff;
+            }
+
+            if (diff.abs() <= 30) {
+              sideRoads.add("straight");
+            } else if (diff > 30 && diff <= 150) {
+              sideRoads.add("right");
+            } else if (diff < -30 && diff >= -150) {
+              sideRoads.add("left");
+            }
           }
         }
 
@@ -3272,6 +3312,8 @@ class _HomePageState extends State<HomePage> {
                             "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
                         userAgentPackageName: 'com.example.frontend',
                       ),
+                      if (_roadPolylines.isNotEmpty)
+                        PolylineLayer(polylines: _roadPolylines),
                       if (_showBoundingBox)
                         PolygonLayer(
                           polygons: [
