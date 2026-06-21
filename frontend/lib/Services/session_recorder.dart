@@ -83,7 +83,7 @@ class SessionRecorder {
       bytes: bytes,
     );
     if (savedPath != null) {
-      debugPrint('Session exported to: $savedPath');
+      print('Session exported to: $savedPath');
     }
     return savedPath;
   }

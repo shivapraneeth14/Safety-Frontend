@@ -1,13 +1,23 @@
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
+import 'package:hive/hive.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'Pages/login_page.dart';
 import 'Pages/signup_page.dart';
-import 'Pages/main_layout.dart'; // 👈 Import this
+import 'Pages/main_layout.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await Hive.initFlutter();
-  await Hive.openBox('roadCache');
+  if (kIsWeb) {
+    await Hive.init();
+  } else {
+    await Hive.initFlutter();
+  }
+  try {
+    await Hive.openBox('roadCache');
+  } catch (e) {
+    debugPrint('⚠️ Failed to open Hive box on web: $e');
+  }
   runApp(const MyApp());
 }
 
