@@ -1657,16 +1657,40 @@ class _HomePageState extends State<HomePage> {
     return 'none';
   }
 
-  void _startSession() {
+  Future<void> _startSession() async {
+    final controller = TextEditingController();
+    final name = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Name this recording'),
+        content: TextField(
+          controller: controller,
+          autofocus: true,
+          decoration: const InputDecoration(
+            hintText: 'e.g. Left Turn Northbound',
+            border: OutlineInputBorder(),
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, controller.text.trim()),
+            child: const Text('Start'),
+          ),
+        ],
+      ),
+    );
+    if (name == null || name.isEmpty) return;
+
     _sessionSnapshots = [];
     _sessionStartTime = DateTime.now();
     _recordingSeconds = 0;
     _isRecording = true;
-    _sessionRecorder.startRide();
+    _sessionRecorder.startRide(name);
     _recordingTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (mounted) setState(() => _recordingSeconds++);
     });
-    debugPrint('🔴 Session recording started');
+    debugPrint('🔴 Session recording started: $name');
   }
 
   Future<void> _stopSessionAndShare() async {
@@ -1674,18 +1698,32 @@ class _HomePageState extends State<HomePage> {
     _recordingTimer?.cancel();
     _recordingTimer = null;
 
-    // Phase 1: Show ride outcome dialog
     Map<String, dynamic>? outcome;
     if (mounted) {
       outcome = await _showRideOutcomeDialog();
     }
 
     await _sessionRecorder.stopRide(outcome: outcome);
+    final file = await _sessionRecorder.getLatestSessionFile();
 
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Ride saved. Share from Profile page.')),
+    if (mounted && file != null) {
+      final export = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Recording saved'),
+          content: Text('${_sessionRecorder.currentLabel}\n${_recordingSeconds}s · ${_sessionRecorder.snapshotCount} frames'),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Done')),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Export File'),
+            ),
+          ],
+        ),
       );
+      if (export == true && file.existsSync()) {
+        await Share.shareXFiles([XFile(file.path)], subject: 'Safety App Session');
+      }
       setState(() {});
     }
   }

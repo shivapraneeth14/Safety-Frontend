@@ -27,7 +27,7 @@ class DebugOverlay extends StatelessWidget {
   final bool isRecording;
   final int recordingSeconds;
   final int snapshotCount;
-  final VoidCallback? onStartRecording;
+  final Future<void> Function()? onStartRecording;
   final VoidCallback? onStopRecording;
   final VoidCallback? onListRecordings;
 
@@ -586,7 +586,7 @@ class _Header extends StatelessWidget {
   final bool isRecording;
   final int recordingSeconds;
   final int snapshotCount;
-  final VoidCallback? onStartRecording;
+  final Future<void> Function()? onStartRecording;
   final VoidCallback? onStopRecording;
 
   const _Header({

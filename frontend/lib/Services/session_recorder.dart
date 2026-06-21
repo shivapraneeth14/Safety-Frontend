@@ -7,14 +7,11 @@ class SessionRecorder {
   List<Map<String, dynamic>> _snapshots = [];
   DateTime? _rideStartTime;
   DateTime? _rideEndTime;
-  String? _currentRideId;
+  String _currentRideId = '';
   bool _isRecording = false;
-  int _recordingInterval = 0;
-  Map<String, dynamic>? _lastFullResponse;
-  Map<String, dynamic>? _lastMapMatch;
+  String _currentLabel = '';
 
   static const int maxSnapshots = 3600;
-  static const int sparseInterval = 30;
 
   String? _backendVersion;
 
@@ -22,15 +19,14 @@ class SessionRecorder {
     _backendVersion = version;
   }
 
-  void startRide() {
+  void startRide(String label) {
     _snapshots = [];
     _rideStartTime = DateTime.now();
     _rideEndTime = null;
-    _currentRideId = 'ride_${_rideStartTime!.millisecondsSinceEpoch}';
+    _currentLabel = label;
+    final sanitized = label.replaceAll(RegExp(r'[^\w\- ]'), '').replaceAll(' ', '_');
+    _currentRideId = sanitized.isEmpty ? 'ride_${_rideStartTime!.millisecondsSinceEpoch}' : sanitized;
     _isRecording = true;
-    _recordingInterval = 0;
-    _lastFullResponse = null;
-    _lastMapMatch = null;
   }
 
   Future<void> stopRide({Map<String, dynamic>? outcome}) async {
@@ -51,29 +47,8 @@ class SessionRecorder {
     if (!_isRecording) return;
     if (_snapshots.length >= maxSnapshots) return;
 
-    _recordingInterval++;
-    final hasThreats = (serverResponse['threats'] as List?)?.isNotEmpty ?? false;
-    final mapMatchChanged = _mapMatchChanged(serverResponse['mapMatch']);
-
-    if (!hasThreats && !mapMatchChanged && _snapshots.isNotEmpty) {
-      if (_recordingInterval % sparseInterval != 0) return;
-      _snapshots.add({
-        't': _elapsedSec(),
-        'type': 'heartbeat',
-        'meta': {
-          'rttMs': roundTripMs,
-          'batteryPct': batteryPct,
-          'networkType': networkType,
-          'gpsAccuracy': gpsAccuracy,
-        },
-      });
-      return;
-    }
-
-    _lastFullResponse = serverResponse;
     _snapshots.add({
       't': _elapsedSec(),
-      'type': hasThreats ? 'threat' : 'state',
       'sent': _sanitizeForStorage(sentPayload),
       'received': _sanitizeForStorage(serverResponse),
       'meta': {
@@ -85,24 +60,12 @@ class SessionRecorder {
     });
   }
 
-  bool _mapMatchChanged(Map<String, dynamic>? current) {
-    if (current == null && _lastMapMatch == null) return false;
-    if (current == null || _lastMapMatch == null) return true;
-    if (current['roadId'] != _lastMapMatch!['roadId']) return true;
-    if ((current['confidence'] ?? 0) != (_lastMapMatch!['confidence'] ?? 0)) {
-      if ((current['confidence'] ?? 0) - (_lastMapMatch!['confidence'] ?? 0) > 0.1) return true;
-    }
-    _lastMapMatch = Map<String, dynamic>.from(current);
-    return false;
-  }
-
   double _elapsedSec() {
     if (_rideStartTime == null) return 0;
     return DateTime.now().difference(_rideStartTime!).inMilliseconds / 1000.0;
   }
 
   Future<void> _saveSession(Map<String, dynamic>? outcome) async {
-    if (_snapshots.isEmpty) return;
     final threatCounts = <String, int>{};
     int totalAlerts = 0;
     for (final snap in _snapshots) {
@@ -115,6 +78,7 @@ class SessionRecorder {
     }
 
     final session = {
+      'name': _currentLabel,
       'appVersion': '1.0.0',
       'backendVersion': _backendVersion ?? 'unknown',
       'modelVersion': 'sprint4',
@@ -125,7 +89,7 @@ class SessionRecorder {
           ? _rideEndTime!.difference(_rideStartTime!).inSeconds
           : 0,
       'snapshotCount': _snapshots.length,
-      'snapshots': _snapshots,
+      'frames': _snapshots,
       'summary': {
         'totalAlerts': totalAlerts,
         'threatTypes': threatCounts,
@@ -160,6 +124,11 @@ class SessionRecorder {
     }
   }
 
+  Future<File?> getLatestSessionFile() async {
+    final files = await getPastSessions();
+    return files.isNotEmpty ? files.first : null;
+  }
+
   Future<void> shareLatestSession() async {
     final files = await getPastSessions();
     if (files.isEmpty) return;
@@ -169,10 +138,6 @@ class SessionRecorder {
   Map<String, dynamic> _sanitizeForStorage(Map<String, dynamic>? data) {
     if (data == null) return {};
     final sanitized = Map<String, dynamic>.from(data);
-    sanitized.remove('accel');
-    sanitized.remove('gyro');
-    sanitized.remove('magnetometer');
-    sanitized.remove('sensorQuality');
     sanitized.remove('connectivity');
     return sanitized;
   }
@@ -185,4 +150,5 @@ class SessionRecorder {
           ? _rideEndTime!.difference(_rideStartTime!).inSeconds
           : 0;
   String? get currentRideId => _currentRideId;
+  String get currentLabel => _currentLabel;
 }
