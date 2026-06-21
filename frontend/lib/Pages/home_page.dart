@@ -1698,32 +1698,40 @@ class _HomePageState extends State<HomePage> {
     _recordingTimer?.cancel();
     _recordingTimer = null;
 
-    Map<String, dynamic>? outcome;
-    if (mounted) {
-      outcome = await _showRideOutcomeDialog();
+    if (!mounted) return;
+
+    final outcome = await _showRideOutcomeDialog();
+    if (!mounted) return;
+
+    final save = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Recording Complete'),
+        content: Text('${_sessionRecorder.currentLabel}\n${_recordingSeconds}s · ${_sessionRecorder.snapshotCount} frames'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('✕ Discard', style: TextStyle(color: Colors.red)),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Export'),
+          ),
+        ],
+      ),
+    );
+    if (!mounted) return;
+
+    if (save != true) {
+      setState(() {});
+      return;
     }
 
     await _sessionRecorder.stopRide(outcome: outcome);
     final file = await _sessionRecorder.getLatestSessionFile();
 
-    if (mounted && file != null) {
-      final export = await showDialog<bool>(
-        context: context,
-        builder: (ctx) => AlertDialog(
-          title: const Text('Recording saved'),
-          content: Text('${_sessionRecorder.currentLabel}\n${_recordingSeconds}s · ${_sessionRecorder.snapshotCount} frames'),
-          actions: [
-            TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Done')),
-            TextButton(
-              onPressed: () => Navigator.pop(ctx, true),
-              child: const Text('Export File'),
-            ),
-          ],
-        ),
-      );
-      if (export == true && file.existsSync()) {
-        await Share.shareXFiles([XFile(file.path)], subject: 'Safety App Session');
-      }
+    if (mounted && file != null && file.existsSync()) {
+      await Share.shareXFiles([XFile(file.path)], subject: 'Safety App Session');
       setState(() {});
     }
   }
