@@ -19,7 +19,7 @@ import 'turn_debug.dart';
 import '../road_utils.dart';
 import 'dart:io';
 import 'package:path_provider/path_provider.dart';
-import 'package:share_plus/share_plus.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 
 // ─── Pure helper functions for turn detection ───
@@ -1728,10 +1728,12 @@ class _HomePageState extends State<HomePage> {
     }
 
     await _sessionRecorder.stopRide(outcome: outcome);
-    final file = await _sessionRecorder.getLatestSessionFile();
+    final savedPath = await _sessionRecorder.exportSession(_sessionRecorder.currentLabel);
 
-    if (mounted && file != null && file.existsSync()) {
-      await Share.shareXFiles([XFile(file.path)], subject: 'Safety App Session');
+    if (mounted && savedPath != null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Saved to: $savedPath')),
+      );
       setState(() {});
     }
   }
@@ -1838,9 +1840,17 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _shareRecording(String filePath) async {
     try {
-      await Share.shareXFiles([XFile(filePath)], subject: 'Safety App Debug Session');
+      final file = File(filePath);
+      if (!await file.exists()) return;
+      final bytes = await file.readAsBytes();
+      final name = filePath.split('/').last;
+      await FilePicker.platform.saveFile(
+        dialogTitle: 'Save recording',
+        fileName: name,
+        bytes: bytes,
+      );
     } catch (e) {
-      debugPrint('❌ Failed to share recording: $e');
+      debugPrint('❌ Failed to save recording: $e');
     }
   }
 

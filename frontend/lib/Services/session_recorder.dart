@@ -1,7 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 import 'package:path_provider/path_provider.dart';
-import 'package:share_plus/share_plus.dart';
+import 'package:file_picker/file_picker.dart';
 
 class SessionRecorder {
   List<Map<String, dynamic>> _snapshots = [];
@@ -66,6 +66,29 @@ class SessionRecorder {
   }
 
   Future<void> _saveSession(Map<String, dynamic>? outcome) async {
+    final session = _buildExportData(outcome: outcome);
+    final dir = await getApplicationDocumentsDirectory();
+    final sessionsDir = Directory('${dir.path}/sessions');
+    if (!await sessionsDir.exists()) await sessionsDir.create();
+    final file = File('${sessionsDir.path}/$_currentRideId.json');
+    await file.writeAsString(const JsonEncoder.withIndent('  ').convert(session));
+  }
+
+  Future<String?> exportSession(String fileName) async {
+    final jsonStr = const JsonEncoder.withIndent('  ').convert(_buildExportData());
+    final bytes = utf8.encode(jsonStr);
+    final savedPath = await FilePicker.platform.saveFile(
+      dialogTitle: 'Save ride recording',
+      fileName: '$fileName.json',
+      bytes: bytes,
+    );
+    if (savedPath != null) {
+      debugPrint('Session exported to: $savedPath');
+    }
+    return savedPath;
+  }
+
+  Map<String, dynamic> _buildExportData({Map<String, dynamic>? outcome}) {
     final threatCounts = <String, int>{};
     int totalAlerts = 0;
     for (final snap in _snapshots) {
@@ -77,7 +100,7 @@ class SessionRecorder {
       }
     }
 
-    final session = {
+    return {
       'name': _currentLabel,
       'appVersion': '1.0.0',
       'backendVersion': _backendVersion ?? 'unknown',
@@ -101,12 +124,6 @@ class SessionRecorder {
         'userReportedIssue': null,
       },
     };
-
-    final dir = await getApplicationDocumentsDirectory();
-    final sessionsDir = Directory('${dir.path}/sessions');
-    if (!await sessionsDir.exists()) await sessionsDir.create();
-    final file = File('${sessionsDir.path}/$_currentRideId.json');
-    await file.writeAsString(const JsonEncoder.withIndent('  ').convert(session));
   }
 
   Future<List<File>> getPastSessions() async {
@@ -127,12 +144,6 @@ class SessionRecorder {
   Future<File?> getLatestSessionFile() async {
     final files = await getPastSessions();
     return files.isNotEmpty ? files.first : null;
-  }
-
-  Future<void> shareLatestSession() async {
-    final files = await getPastSessions();
-    if (files.isEmpty) return;
-    await Share.shareXFiles([XFile(files.first.path)], subject: 'Safety App Session');
   }
 
   Map<String, dynamic> _sanitizeForStorage(Map<String, dynamic>? data) {
