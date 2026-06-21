@@ -1711,6 +1711,21 @@ class _HomePageState extends State<HomePage> {
     final outcome = await _showRideOutcomeDialog();
     if (!mounted) return;
 
+    await _sessionRecorder.stopRide(outcome: outcome);
+
+    final autoPath = await saveRecordingFile(
+      _sessionRecorder.currentLabel,
+      _sessionRecorder.getSessionJsonString(),
+    );
+
+    if (mounted && autoPath.isNotEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Saved to: $autoPath')),
+      );
+    }
+
+    if (!mounted) return;
+
     final save = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -1723,7 +1738,7 @@ class _HomePageState extends State<HomePage> {
           ),
           TextButton(
             onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('Export'),
+            child: const Text('Export As…'),
           ),
         ],
       ),
@@ -1735,15 +1750,13 @@ class _HomePageState extends State<HomePage> {
       return;
     }
 
-    await _sessionRecorder.stopRide(outcome: outcome);
-    final savedPath = await _sessionRecorder.exportSession(_sessionRecorder.currentLabel);
-
-    if (mounted && savedPath != null) {
+    final exportPath = await _sessionRecorder.exportSession(_sessionRecorder.currentLabel);
+    if (mounted && exportPath != null) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Saved to: $savedPath')),
+        SnackBar(content: Text('Exported to: $exportPath')),
       );
-      setState(() {});
     }
+    if (mounted) setState(() {});
   }
 
   Future<Map<String, dynamic>> _showRideOutcomeDialog() async {

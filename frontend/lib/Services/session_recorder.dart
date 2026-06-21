@@ -8,6 +8,7 @@ class SessionRecorder {
   String _currentRideId = '';
   bool _isRecording = false;
   String _currentLabel = '';
+  Map<String, dynamic>? _rideOutcome;
 
   static const int maxSnapshots = 3600;
 
@@ -31,6 +32,7 @@ class SessionRecorder {
     if (!_isRecording) return;
     _isRecording = false;
     _rideEndTime = DateTime.now();
+    _rideOutcome = outcome;
   }
 
   void recordExchange({
@@ -76,7 +78,11 @@ class SessionRecorder {
     return savedPath;
   }
 
-  Map<String, dynamic> _buildExportData({Map<String, dynamic>? outcome}) {
+  String getSessionJsonString() {
+    return const JsonEncoder.withIndent('  ').convert(_buildExportData());
+  }
+
+  Map<String, dynamic> _buildExportData() {
     final threatCounts = <String, int>{};
     int totalAlerts = 0;
     for (final snap in _snapshots) {
@@ -106,7 +112,7 @@ class SessionRecorder {
         'threatTypes': threatCounts,
         'snapshotCount': _snapshots.length,
       },
-      'rideOutcome': outcome ?? {
+      'rideOutcome': _rideOutcome ?? {
         'userReportedNearMiss': false,
         'userReportedFalseAlert': 0,
         'userReportedIssue': null,

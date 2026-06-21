@@ -11,3 +11,5 @@ Future<List<RecordingFileInfo>> getSavedRecordings() async => [];
 Future<void> deleteRecordingFile(String path) async {}
 
 Future<String> readRecordingFile(String path) async => '';
+
+Future<String> saveRecordingFile(String name, String content) async => '';

@@ -30,3 +30,17 @@ Future<void> deleteRecordingFile(String path) async {
 Future<String> readRecordingFile(String path) async {
   return await File(path).readAsString();
 }
+
+Future<String> saveRecordingFile(String name, String content) async {
+  final dir = await getApplicationDocumentsDirectory();
+  final sessionsDir = Directory('${dir.path}/sessions');
+  if (!await sessionsDir.exists()) {
+    await sessionsDir.create(recursive: true);
+  }
+  final safeName = name.replaceAll(RegExp(r'[^\w\- ]'), '').replaceAll(' ', '_');
+  final timestamp = DateTime.now().millisecondsSinceEpoch;
+  final fileName = '${safeName.isEmpty ? 'recording' : safeName}_$timestamp.json';
+  final file = File('${sessionsDir.path}/$fileName');
+  await file.writeAsString(content);
+  return file.path;
+}
