@@ -1,12 +1,13 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:geolocator/geolocator.dart';
-import 'package:flutter_compass/flutter_compass.dart';
+import '../Services/compass_service.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
@@ -14,11 +15,11 @@ import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import '../Config/app_config.dart';
 import '../Services/session_recorder.dart';
+import '../Services/file_helpers.dart';
 import 'debug_overlay.dart';
 import 'turn_debug.dart';
 import '../road_utils.dart';
-import 'dart:io';
-import 'package:path_provider/path_provider.dart';
+import 'dart:convert';
 import 'package:file_picker/file_picker.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 
@@ -300,7 +301,7 @@ class _HomePageState extends State<HomePage> {
   Timer? _clearThreatTimer;
 
   StreamSubscription<Position>? _positionStream;
-  StreamSubscription<CompassEvent>? _compassStream;
+  StreamSubscription<double>? _compassStream;
   StreamSubscription<AccelerometerEvent>? _accelStream;
   StreamSubscription<GyroscopeEvent>? _gyroStream;
   StreamSubscription<MagnetometerEvent>? _magStream;
@@ -985,13 +986,16 @@ class _HomePageState extends State<HomePage> {
   }
 
   void _initCompass() {
-    _compassStream = FlutterCompass.events?.listen((event) {
-      if (event.heading != null) {
-        _hasCompassHeading = true;
-        _rotation = event.heading!; // raw compass degrees
-        _updateHeadingFromSources();
-        if (mounted) setState(() {});
-      }
+    final stream = getCompassHeadingStream();
+    if (stream == null) {
+      debugPrint('Compass not available');
+      return;
+    }
+    _compassStream = stream.listen((heading) {
+      _hasCompassHeading = true;
+      _rotation = heading;
+      _updateHeadingFromSources();
+      if (mounted) setState(() {});
     });
   }
 
@@ -1072,9 +1076,13 @@ class _HomePageState extends State<HomePage> {
   // Calibration persistence disabled; using fixed offset above
 
   void _initSensors() {
-    _accelStream = accelerometerEvents.listen((e) => _lastAccel = e);
-    _gyroStream = gyroscopeEvents.listen((e) => _lastGyro = e);
-    _magStream = magnetometerEvents.listen((e) => _lastMag = e);
+    try {
+      _accelStream = accelerometerEvents.listen((e) => _lastAccel = e);
+      _gyroStream = gyroscopeEvents.listen((e) => _lastGyro = e);
+      _magStream = magnetometerEvents.listen((e) => _lastMag = e);
+    } catch (e) {
+      debugPrint('📡 Sensors not available: $e');
+    }
   }
 
   void _initConnectivity() {
@@ -1823,26 +1831,15 @@ class _HomePageState extends State<HomePage> {
     _sessionSnapshots.add(snapshot);
   }
 
-  Future<List<File>> _getRecordingFiles() async {
-    try {
-      final dir = await getApplicationDocumentsDirectory();
-      final sessionsDir = Directory('${dir.path}/sessions');
-      if (!await sessionsDir.exists()) return [];
-      final files = await sessionsDir.list().where(
-        (f) => f is File && f.path.endsWith('.json') && f.path.contains('ride_'),
-      ).cast<File>().toList();
-      files.sort((a, b) => b.lastModifiedSync().compareTo(a.lastModifiedSync()));
-      return files;
-    } catch (_) {
-      return [];
-    }
+  Future<List<RecordingFileInfo>> _getRecordingFiles() async {
+    return getSavedRecordings();
   }
 
   Future<void> _shareRecording(String filePath) async {
     try {
-      final file = File(filePath);
-      if (!await file.exists()) return;
-      final bytes = await file.readAsBytes();
+      final content = await readRecordingFile(filePath);
+      if (content.isEmpty) return;
+      final bytes = utf8.encode(content);
       final name = filePath.split('/').last;
       await FilePicker.platform.saveFile(
         dialogTitle: 'Save recording',
@@ -1856,7 +1853,7 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _deleteRecording(String filePath) async {
     try {
-      await File(filePath).delete();
+      await deleteRecordingFile(filePath);
       if (mounted) setState(() {});
     } catch (e) {
       debugPrint('❌ Failed to delete recording: $e');
@@ -1905,17 +1902,16 @@ class _HomePageState extends State<HomePage> {
                   itemCount: files.length,
                   itemBuilder: (_, i) {
                     final f = files[i];
-                    final size = f.lengthSync();
-                    final modified = f.lastModifiedSync();
-                    final name = f.uri.pathSegments.last;
-                    final sizeStr = size > 1024 ? '${(size / 1024).toStringAsFixed(1)} KB' : '${size} B';
+                    final sizeStr = f.sizeBytes > 1024
+                        ? '${(f.sizeBytes / 1024).toStringAsFixed(1)} KB'
+                        : '${f.sizeBytes} B';
                     return Card(
                       color: Colors.white10,
                       margin: const EdgeInsets.only(bottom: 6),
                       child: ListTile(
                         dense: true,
-                        title: Text(name, style: const TextStyle(color: Colors.white, fontSize: 12)),
-                        subtitle: Text('$sizeStr • ${modified.toString().substring(0, 19)}', style: const TextStyle(color: Colors.white38, fontSize: 10)),
+                        title: Text(f.name, style: const TextStyle(color: Colors.white, fontSize: 12)),
+                        subtitle: Text('$sizeStr • ${f.modified.toString().substring(0, 19)}', style: const TextStyle(color: Colors.white38, fontSize: 10)),
                         trailing: Row(
                           mainAxisSize: MainAxisSize.min,
                           children: [

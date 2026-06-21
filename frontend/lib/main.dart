@@ -9,7 +9,7 @@ import 'Pages/main_layout.dart';
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   if (kIsWeb) {
-    await Hive.init();
+    Hive.init('');
   } else {
     await Hive.initFlutter();
   }

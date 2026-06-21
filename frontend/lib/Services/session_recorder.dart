@@ -1,6 +1,4 @@
 import 'dart:convert';
-import 'dart:io';
-import 'package:path_provider/path_provider.dart';
 import 'package:file_picker/file_picker.dart';
 
 class SessionRecorder {
@@ -33,7 +31,6 @@ class SessionRecorder {
     if (!_isRecording) return;
     _isRecording = false;
     _rideEndTime = DateTime.now();
-    await _saveSession(outcome);
   }
 
   void recordExchange({
@@ -63,15 +60,6 @@ class SessionRecorder {
   double _elapsedSec() {
     if (_rideStartTime == null) return 0;
     return DateTime.now().difference(_rideStartTime!).inMilliseconds / 1000.0;
-  }
-
-  Future<void> _saveSession(Map<String, dynamic>? outcome) async {
-    final session = _buildExportData(outcome: outcome);
-    final dir = await getApplicationDocumentsDirectory();
-    final sessionsDir = Directory('${dir.path}/sessions');
-    if (!await sessionsDir.exists()) await sessionsDir.create();
-    final file = File('${sessionsDir.path}/$_currentRideId.json');
-    await file.writeAsString(const JsonEncoder.withIndent('  ').convert(session));
   }
 
   Future<String?> exportSession(String fileName) async {
@@ -124,26 +112,6 @@ class SessionRecorder {
         'userReportedIssue': null,
       },
     };
-  }
-
-  Future<List<File>> getPastSessions() async {
-    try {
-      final dir = Directory('${(await getApplicationDocumentsDirectory()).path}/sessions');
-      if (!await dir.exists()) return [];
-      final files = await dir.list()
-          .where((f) => f is File && f.path.endsWith('.json'))
-          .cast<File>()
-          .toList();
-      files.sort((a, b) => b.lastModifiedSync().compareTo(a.lastModifiedSync()));
-      return files;
-    } catch (_) {
-      return [];
-    }
-  }
-
-  Future<File?> getLatestSessionFile() async {
-    final files = await getPastSessions();
-    return files.isNotEmpty ? files.first : null;
   }
 
   Map<String, dynamic> _sanitizeForStorage(Map<String, dynamic>? data) {
